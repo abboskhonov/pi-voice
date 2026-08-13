@@ -638,8 +638,8 @@ export const CATALOG_MODELS_GENERATED = [
   },
   {
     "id": "cohere-transcribe-arabic-07-2026",
-    "name": "Cohere Transcribe",
-    "description": "2-language speech-to-text.",
+    "name": "Cohere Transcribe Arabic",
+    "description": "Arabic and English speech-to-text.",
     "repository": "handy-computer/cohere-transcribe-arabic-07-2026-gguf",
     "revision": "715cbe09ca9b60fc1e497db1e4478fa9fcf4ac21",
     "license": "apache-2.0",

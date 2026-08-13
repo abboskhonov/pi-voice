@@ -4,12 +4,11 @@ import {
   getHFHubCachePath,
   getRepoFolderName,
 } from "@huggingface/hub";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   createReadStream,
   createWriteStream,
   existsSync,
-  readdirSync,
   statSync,
 } from "node:fs";
 import {
@@ -36,37 +35,25 @@ function repositoryCacheDirectory(model: CatalogModel): string {
   );
 }
 
-function snapshotsDirectory(model: CatalogModel): string {
-  return join(repositoryCacheDirectory(model), "snapshots");
-}
-
 export type CachedCatalogModel = {
   path: string;
 };
 
-/** Find the catalog file in the standard HF cache. Exact pinned-revision paths
- * win, but older `main` downloads are also recognized by size. */
+/** Find the exact catalog revision in the standard Hugging Face cache. */
 export function findCachedCatalogModel(model: CatalogModel): CachedCatalogModel | undefined {
-  const snapshots = snapshotsDirectory(model);
-  const revisions = [
+  const path = join(
+    repositoryCacheDirectory(model),
+    "snapshots",
     model.revision,
-    ...(existsSync(snapshots)
-      ? readdirSync(snapshots, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory() && entry.name !== model.revision)
-          .map((entry) => entry.name)
-      : []),
-  ];
-
-  for (const revision of revisions) {
-    const path = join(snapshots, revision, model.filename);
-    if (!existsSync(path)) continue;
-    try {
-      if (statSync(path).size === model.size) return { path };
-    } catch {
-      // A cache entry can disappear during concurrent HF cache maintenance.
-    }
+    model.filename,
+  );
+  if (!existsSync(path)) return undefined;
+  try {
+    return statSync(path).size === model.size ? { path } : undefined;
+  } catch {
+    // A cache entry can disappear during concurrent HF cache maintenance.
+    return undefined;
   }
-  return undefined;
 }
 
 async function sha256(path: string, signal?: AbortSignal): Promise<string> {
@@ -158,7 +145,8 @@ export async function downloadCatalogModel(
     );
   }
 
-  const etag = (info.xet?.hash ?? info.etag).replace(/^W\//, "").replace(/^"|"$/g, "");
+  // Match Hugging Face's standard cache key for these LFS-backed model files.
+  const etag = info.etag.replace(/^W\//, "").replace(/^"|"$/g, "");
   const blobPath = join(storage, "blobs", etag);
   await mkdir(dirname(blobPath), { recursive: true });
   await mkdir(dirname(pointerPath), { recursive: true });
@@ -169,7 +157,9 @@ export async function downloadCatalogModel(
     return pointerPath;
   }
 
-  const incompletePath = `${blobPath}.incomplete`;
+  // Each process owns its partial file. Concurrent downloads may duplicate work,
+  // but cannot overwrite or remove one another's bytes.
+  const incompletePath = `${blobPath}.${process.pid}.${randomUUID()}.incomplete`;
   const blob = await downloadFile({
     repo: model.repository,
     path: model.filename,
@@ -203,7 +193,24 @@ export async function downloadCatalogModel(
       { signal },
     );
     signal?.throwIfAborted();
-    await rename(incompletePath, blobPath);
+
+    const incompleteStat = await stat(incompletePath);
+    if (incompleteStat.size !== model.size || (await sha256(incompletePath, signal)) !== model.sha256) {
+      throw new Error(`${model.name} verification failed; incomplete bytes were removed`);
+    }
+    signal?.throwIfAborted();
+
+    if (await exists(blobPath)) {
+      await rm(incompletePath, { force: true });
+    } else {
+      try {
+        await rename(incompletePath, blobPath);
+      } catch (error) {
+        // Another process may have published the same verified blob first.
+        if (!(await exists(blobPath))) throw error;
+        await rm(incompletePath, { force: true });
+      }
+    }
     await createCacheLink(blobPath, pointerPath);
     onProgress?.({ downloaded: blob.size, total: blob.size });
     return pointerPath;

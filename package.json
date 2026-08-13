@@ -1,6 +1,6 @@
 {
   "name": "@earendil-works/pi-transcribe",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Local speech-to-text dictation for Pi",
   "type": "module",
   "license": "MIT",
@@ -56,6 +56,7 @@
   "dependencies": {
     "@huggingface/hub": "2.15.0",
     "@picovoice/pvrecorder-node": "1.2.9",
+    "opencc-js": "^1.4.1",
     "transcribe-cpp": "0.1.3"
   }
 }

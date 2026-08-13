@@ -26,6 +26,7 @@ import {
   DEFAULT_MICROPHONE,
   settingsForModel,
   writeSettings,
+  type ChineseOutput,
   type MicrophoneSetting,
   type TranscribeSettings,
   type TranscriptionLanguage,
@@ -87,8 +88,10 @@ type ModelSelectionOptions = {
   shortcut?: string;
   preferredLanguages?: readonly string[];
   transcriptionLanguage?: TranscriptionLanguage;
+  chineseOutput?: ChineseOutput;
   currentModelId?: string;
   microphone?: MicrophoneSetting;
+  onPreferredLanguagesChange?: (languages: string[]) => Promise<void>;
 };
 
 export async function runModelSelection(
@@ -109,7 +112,17 @@ export async function runModelSelection(
     if (!selection) return undefined;
     if (selection.type === "change-languages") {
       const changed = await chooseLanguages(ctx, preferredLanguages);
-      if (changed) preferredLanguages = changed;
+      if (changed) {
+        try {
+          await options.onPreferredLanguagesChange?.(changed);
+          preferredLanguages = changed;
+        } catch (error) {
+          ctx.ui.notify(
+            `Could not save preferred languages: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
+        }
+      }
       continue;
     }
 
@@ -197,6 +210,7 @@ export async function runModelSelection(
         shortcut: options.shortcut ?? DEFAULT_SHORTCUT,
         preferredLanguages,
         transcriptionLanguage: options.transcriptionLanguage,
+        chineseOutput: options.chineseOutput,
         microphone: options.microphone ?? DEFAULT_MICROPHONE,
       });
       await writeSettings(settings);

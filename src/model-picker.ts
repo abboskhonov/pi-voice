@@ -13,6 +13,8 @@ import {
   matchesKey,
   Spacer,
   Text,
+  truncateToWidth,
+  visibleWidth,
   type KeybindingsManager,
   type TUI,
 } from "@earendil-works/pi-tui";
@@ -35,6 +37,23 @@ const MAX_VISIBLE_LANGUAGES = 9;
 const MAX_VISIBLE_MODELS = 10;
 const MODEL_NAME_WIDTH = 34;
 const MODEL_DETAIL_WIDTH = 18;
+const TRANSCRIPTION_LANGUAGE_NAME_WIDTH = 28;
+
+function padColumn(value: string, width: number): string {
+  const truncated = truncateToWidth(value, width, "…");
+  return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
+}
+
+function transcriptionLanguageName(
+  language: string,
+  supportedLanguages: readonly string[],
+): string {
+  const base = canonicalLanguage(language);
+  const variants = supportedLanguages.filter(
+    (supported) => canonicalLanguage(supported) === base,
+  );
+  return displayLanguage(variants.length > 1 ? language : base);
+}
 
 function selectedWindow<T>(items: readonly T[], selected: number, maximum: number): [number, number] {
   const start = Math.max(
@@ -302,9 +321,10 @@ class CatalogModelPicker extends Container implements Focusable {
       }
 
       const selected = this.filtered[this.selectedIndex]!;
+      const languageCount = new Set(selected.languages.map(canonicalLanguage)).size;
       const features = [
         selected.capabilities.languageDetection ? "auto language detection" : undefined,
-        `${selected.languages.length} language${selected.languages.length === 1 ? "" : "s"}`,
+        `${languageCount} language${languageCount === 1 ? "" : "s"}`,
         selected.parameters ?? undefined,
       ].filter((value): value is string => Boolean(value));
       this.detail.setText(
@@ -400,37 +420,204 @@ export async function chooseCatalogModel(
   );
 }
 
-export function transcriptionLanguageSummary(language: TranscriptionLanguage): string {
-  return language === "auto" ? "Auto detect" : displayLanguage(language);
+type TranscriptionLanguageChoice = {
+  value: TranscriptionLanguage;
+  name: string;
+  preferred: boolean;
+};
+
+class TranscriptionLanguagePicker extends Container implements Focusable {
+  private readonly search = new Input();
+  private readonly list = new Container();
+  private readonly footer = new Text("", 1, 0);
+  private readonly choices: TranscriptionLanguageChoice[];
+  private filtered: TranscriptionLanguageChoice[] = [];
+  private selectedIndex = 0;
+  private _focused = false;
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    this.search.focused = value;
+  }
+
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: UiTheme,
+    private readonly keybindings: KeybindingsManager,
+    model: CatalogModel,
+    current: TranscriptionLanguage,
+    preferredLanguages: readonly string[],
+    private readonly done: (language: TranscriptionLanguage | undefined) => void,
+  ) {
+    super();
+    const preferred = new Set(preferredLanguages.map(canonicalLanguage));
+    const languages = [...new Set(model.languages)]
+      .map((language) => ({
+        value: language,
+        name: transcriptionLanguageName(language, model.languages),
+        preferred: preferred.has(canonicalLanguage(language)),
+      }))
+      .sort(
+        (left, right) =>
+          Number(right.preferred) - Number(left.preferred) ||
+          left.name.localeCompare(right.name) ||
+          left.value.localeCompare(right.value),
+      );
+    this.choices = [
+      ...(model.capabilities.languageDetection
+        ? [{ value: "auto", name: "Auto detect", preferred: false }]
+        : []),
+      ...languages,
+    ];
+    this.filtered = this.choices;
+    this.selectedIndex = Math.max(
+      0,
+      this.choices.findIndex((choice) => choice.value === current),
+    );
+
+    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    this.addChild(new Spacer(1));
+    this.addChild(
+      new Text(theme.fg("accent", theme.bold("Choose transcription language")), 1, 0),
+    );
+    this.addChild(
+      new Text(
+        theme.fg("muted", "★ Your languages are shown first. Type to search."),
+        1,
+        0,
+      ),
+    );
+    this.addChild(new Spacer(1));
+    this.addChild(this.search);
+    this.addChild(new Spacer(1));
+    this.addChild(this.list);
+    this.addChild(new Spacer(1));
+    this.addChild(this.footer);
+    this.addChild(new Spacer(1));
+    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    this.refresh();
+  }
+
+  private refresh(): void {
+    const query = this.search.getValue().trim();
+    this.filtered = query
+      ? fuzzyFilter(this.choices, query, (choice) => `${choice.name} ${choice.value}`)
+      : this.choices;
+    this.selectedIndex = Math.min(
+      this.selectedIndex,
+      Math.max(0, this.filtered.length - 1),
+    );
+    this.list.clear();
+
+    if (this.filtered.length === 0) {
+      this.list.addChild(new Text(this.theme.fg("muted", "  No matching languages"), 0, 0));
+    } else {
+      const [start, end] = selectedWindow(
+        this.filtered,
+        this.selectedIndex,
+        MAX_VISIBLE_LANGUAGES,
+      );
+      for (let index = start; index < end; index += 1) {
+        const choice = this.filtered[index]!;
+        const active = index === this.selectedIndex;
+        const prefix = active ? this.theme.fg("accent", "→ ") : "  ";
+        const nameText = padColumn(choice.name, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
+        const name = active ? this.theme.fg("accent", nameText) : nameText;
+        const code = choice.value === "auto" ? "" : this.theme.fg("dim", choice.value);
+        const yours = choice.preferred ? `  ${this.theme.fg("accent", "★")}` : "";
+        this.list.addChild(new Text(`${prefix}${name}  ${code}${yours}`, 0, 0));
+      }
+      if (start > 0 || end < this.filtered.length) {
+        this.list.addChild(
+          new Text(
+            this.theme.fg(
+              "muted",
+              `  (${this.selectedIndex + 1}/${this.filtered.length})`,
+            ),
+            0,
+            0,
+          ),
+        );
+      }
+    }
+
+    const shown = query
+      ? `${this.filtered.length}/${this.choices.length} matching languages`
+      : `${this.choices.length} choices`;
+    this.footer.setText(
+      `${this.theme.fg("dim", shown)}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "choose")}  ${keyHint("tui.select.cancel", query ? "clear search" : "cancel")}`,
+    );
+    this.tui.requestRender();
+  }
+
+  handleInput(data: string): void {
+    if (this.keybindings.matches(data, "tui.select.up")) {
+      if (this.filtered.length > 0) {
+        this.selectedIndex =
+          this.selectedIndex === 0 ? this.filtered.length - 1 : this.selectedIndex - 1;
+        this.refresh();
+      }
+      return;
+    }
+    if (this.keybindings.matches(data, "tui.select.down")) {
+      if (this.filtered.length > 0) {
+        this.selectedIndex =
+          this.selectedIndex === this.filtered.length - 1 ? 0 : this.selectedIndex + 1;
+        this.refresh();
+      }
+      return;
+    }
+    if (this.keybindings.matches(data, "tui.select.confirm")) {
+      const selected = this.filtered[this.selectedIndex];
+      if (selected) this.done(selected.value);
+      return;
+    }
+    if (this.keybindings.matches(data, "tui.select.cancel")) {
+      if (this.search.getValue()) {
+        this.search.setValue("");
+        this.selectedIndex = 0;
+        this.refresh();
+      } else {
+        this.done(undefined);
+      }
+      return;
+    }
+
+    this.search.handleInput(data);
+    this.selectedIndex = 0;
+    this.refresh();
+  }
+}
+
+export function transcriptionLanguageSummary(
+  language: TranscriptionLanguage,
+  model: CatalogModel,
+): string {
+  return language === "auto"
+    ? "Auto detect"
+    : transcriptionLanguageName(language, model.languages);
 }
 
 export async function chooseTranscriptionLanguage(
   ctx: ExtensionContext,
   model: CatalogModel,
   current: TranscriptionLanguage,
+  preferredLanguages: readonly string[],
 ): Promise<TranscriptionLanguage | undefined> {
-  const languages = [...new Set(model.languages)].sort((left, right) => {
-    const leftBase = canonicalLanguage(left);
-    const rightBase = canonicalLanguage(right);
-    if (leftBase === "en" && rightBase !== "en") return -1;
-    if (rightBase === "en" && leftBase !== "en") return 1;
-    return displayLanguage(left).localeCompare(displayLanguage(right));
-  });
-  const choices: Array<{ label: string; value: TranscriptionLanguage }> = [
-    ...(model.capabilities.languageDetection
-      ? [{ label: "Auto detect", value: "auto" }]
-      : []),
-    ...languages.map((language) => ({
-      label: `${displayLanguage(language)} [${language}]`,
-      value: language,
-    })),
-  ];
-  if (choices.length === 0) return undefined;
-
-  const currentLabel = choices.find((choice) => choice.value === current)?.label;
-  const selected = await ctx.ui.select(
-    `Transcription language${currentLabel ? ` · ${currentLabel}` : ""}`,
-    choices.map((choice) => choice.label),
+  return ctx.ui.custom<TranscriptionLanguage | undefined>(
+    (tui, theme, keybindings, done) =>
+      new TranscriptionLanguagePicker(
+        tui,
+        theme,
+        keybindings,
+        model,
+        current,
+        preferredLanguages,
+        done,
+      ),
   );
-  return choices.find((choice) => choice.label === selected)?.value;
 }
