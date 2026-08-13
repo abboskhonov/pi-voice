@@ -20,7 +20,7 @@ pi install npm:@earendil-works/pi-transcribe
 
 The extension registers:
 
-- a configurable terminal shortcut (`Ctrl+Alt+T` by default) to start and stop recording;
+- a configurable terminal shortcut (`Ctrl+Alt+Z` by default) to start and stop recording;
 - `/transcribe` for model, transcription-language, microphone, and shortcut settings.
 
 To develop or run it from a checkout:

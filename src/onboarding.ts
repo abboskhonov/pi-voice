@@ -33,8 +33,6 @@ import {
 } from "./settings.js";
 import { DEFAULT_SHORTCUT } from "./shortcuts.js";
 
-const STATUS_KEY = "pi-transcribe";
-
 type UiTheme = ExtensionContext["ui"]["theme"];
 
 class DownloadLoader extends Container {
@@ -141,58 +139,48 @@ export async function runModelSelection(
     }
 
     let prepared: { path: string } | { error: unknown } | { cancelled: true };
-    try {
-      prepared = await ctx.ui.custom<
-        { path: string } | { error: unknown } | { cancelled: true }
-      >((tui, theme, _keybindings, done) => {
-        const detail = `${model.quant} · ${formatBinarySize(model.size)}`;
-        const loader = cached
-          ? new BorderedLoader(tui, theme, `Verifying ${model.name} · ${detail}`)
-          : new DownloadLoader(tui, theme, `Downloading ${model.name} · ${detail}`);
-        loader.onAbort = () => {
-          if (loader instanceof DownloadLoader) loader.setMessage(`Cancelling ${model.name}`);
-        };
+    prepared = await ctx.ui.custom<
+      { path: string } | { error: unknown } | { cancelled: true }
+    >((tui, theme, _keybindings, done) => {
+      const detail = `${model.quant} · ${formatBinarySize(model.size)}`;
+      const loader = cached
+        ? new BorderedLoader(tui, theme, `Verifying ${model.name} · ${detail}`)
+        : new DownloadLoader(tui, theme, `Downloading ${model.name} · ${detail}`);
+      loader.onAbort = () => {
+        if (loader instanceof DownloadLoader) loader.setMessage(`Cancelling ${model.name}`);
+      };
 
-        void (async () => {
-          try {
-            let path: string;
-            if (cached) {
-              path = cached.path;
-            } else {
-              ctx.ui.setStatus(STATUS_KEY, `transcription: downloading ${model.name}`);
-              path = await downloadCatalogModel(model, {
-                signal: loader.signal,
-                onProgress: ({ downloaded, total }) => {
-                  const percent = total > 0 ? Math.floor((downloaded / total) * 100) : 0;
-                  const message = `Downloading ${model.name} · ${formatBinarySize(downloaded)} / ${formatBinarySize(total)} · ${percent}%`;
-                  if (loader instanceof DownloadLoader) loader.setMessage(message);
-                  ctx.ui.setStatus(
-                    STATUS_KEY,
-                    `transcription: downloading ${model.name} · ${percent}%`,
-                  );
-                },
-              });
-            }
-
-            if (loader.signal.aborted) {
-              done({ cancelled: true });
-              return;
-            }
-            if (loader instanceof DownloadLoader) {
-              loader.setMessage(`Verifying ${model.name} · ${detail}`);
-            }
-            ctx.ui.setStatus(STATUS_KEY, `transcription: verifying ${model.name}`);
-            await verifyCatalogModel(path, model, loader.signal);
-            done({ path });
-          } catch (error) {
-            done(loader.signal.aborted ? { cancelled: true } : { error });
+      void (async () => {
+        try {
+          let path: string;
+          if (cached) {
+            path = cached.path;
+          } else {
+            path = await downloadCatalogModel(model, {
+              signal: loader.signal,
+              onProgress: ({ downloaded, total }) => {
+                const percent = total > 0 ? Math.floor((downloaded / total) * 100) : 0;
+                const message = `Downloading ${model.name} · ${formatBinarySize(downloaded)} / ${formatBinarySize(total)} · ${percent}%`;
+                if (loader instanceof DownloadLoader) loader.setMessage(message);
+              },
+            });
           }
-        })();
-        return loader;
-      });
-    } finally {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
-    }
+
+          if (loader.signal.aborted) {
+            done({ cancelled: true });
+            return;
+          }
+          if (loader instanceof DownloadLoader) {
+            loader.setMessage(`Verifying ${model.name} · ${detail}`);
+          }
+          await verifyCatalogModel(path, model, loader.signal);
+          done({ path });
+        } catch (error) {
+          done(loader.signal.aborted ? { cancelled: true } : { error });
+        }
+      })();
+      return loader;
+    });
 
     if ("cancelled" in prepared) continue;
 

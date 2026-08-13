@@ -14,7 +14,7 @@ import {
   type KeybindingsManager,
 } from "@earendil-works/pi-tui";
 
-export const DEFAULT_SHORTCUT = "ctrl+alt+t";
+export const DEFAULT_SHORTCUT = "ctrl+alt+z";
 
 const MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"] as const;
 const SPECIAL_KEYS = new Set([
