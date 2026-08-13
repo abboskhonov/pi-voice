@@ -7,7 +7,7 @@ Local speech-to-text dictation for Pi.
 Install directly from GitHub:
 
 ```bash
-pi install git:github.com/earendil-works/pi-transcribe
+pi install ssh://git@github.com/earendil-works/pi-transcribe
 ```
 
 After the first npm release, it can also be installed with:
