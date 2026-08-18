@@ -7,6 +7,7 @@ import {
   MicrophoneUnavailableError,
   testMicrophonePermission,
 } from "./audio.js";
+import { registerFileTranscriptionTool } from "./file-transcription.js";
 import { runModelSelection, runOnboarding } from "./onboarding.js";
 import {
   readSettings,
@@ -55,11 +56,22 @@ export default function piTranscribe(pi: ExtensionAPI): void {
   let stopListening: (() => void) | undefined;
   let settings: TranscribeSettings | undefined;
   let settingsLoaded = false;
+  let settingsReadWarning: string | undefined;
   let settingsWarningShown = false;
+  let fileTranscriptionBusy: () => boolean = () => false;
 
   function rememberSettings(configured: TranscribeSettings): void {
     settings = configured;
     settingsLoaded = true;
+    settingsReadWarning = undefined;
+  }
+
+  async function loadSettingsOnce(): Promise<void> {
+    if (settingsLoaded) return;
+    const result = await readSettings();
+    settingsLoaded = true;
+    settings = result.settings;
+    settingsReadWarning = result.warning;
   }
 
   async function configureFirstRun(
@@ -89,14 +101,10 @@ export default function piTranscribe(pi: ExtensionAPI): void {
   async function ensureSettings(
     ctx: ExtensionContext,
   ): Promise<TranscribeSettings | undefined> {
-    if (!settingsLoaded) {
-      const result = await readSettings();
-      settingsLoaded = true;
-      settings = result.settings;
-      if (result.warning && !settingsWarningShown) {
-        settingsWarningShown = true;
-        ctx.ui.notify(result.warning, "warning");
-      }
+    await loadSettingsOnce();
+    if (settingsReadWarning && !settingsWarningShown) {
+      settingsWarningShown = true;
+      ctx.ui.notify(settingsReadWarning, "warning");
     }
 
     if (settings && existsSync(settings.model.path)) return settings;
@@ -120,6 +128,26 @@ export default function piTranscribe(pi: ExtensionAPI): void {
       );
     }
     return configured;
+  }
+
+  async function requireConfiguredSettingsForTool(): Promise<TranscribeSettings> {
+    await loadSettingsOnce();
+    if (settingsReadWarning) {
+      throw new Error(
+        `${settingsReadWarning} Ask the user to run /transcribe in Pi's interactive TUI to configure a local model, then retry transcribe_file.`,
+      );
+    }
+    if (!settings) {
+      throw new Error(
+        "pi-transcribe is not configured. Ask the user to run /transcribe in Pi's interactive TUI once to choose and download a local model, then retry transcribe_file.",
+      );
+    }
+    if (!existsSync(settings.model.path)) {
+      throw new Error(
+        `The configured transcription model is missing: ${settings.model.path}. Ask the user to run /transcribe and choose a model again, then retry transcribe_file.`,
+      );
+    }
+    return settings;
   }
 
   function listenForCancel(ctx: ExtensionContext): void {
@@ -291,6 +319,10 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     task: () => Promise<void>,
   ): Promise<void> {
+    if (fileTranscriptionBusy()) {
+      ctx.ui.notify("A file transcription is already in progress", "warning");
+      return Promise.resolve();
+    }
     if (operation) {
       ctx.ui.notify("A pi-transcribe operation is already in progress", "warning");
       return operation;
@@ -302,6 +334,12 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     operation = nextOperation;
     return nextOperation;
   }
+
+  const fileTranscription = registerFileTranscriptionTool(pi, {
+    getSettings: requireConfiguredSettingsForTool,
+    isDictationBusy: () => Boolean(recording || operation),
+  });
+  fileTranscriptionBusy = fileTranscription.isBusy;
 
   pi.registerShortcut(
     registeredShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0],
@@ -337,7 +375,10 @@ export default function piTranscribe(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     transcriptionAbort?.abort();
-    await operation?.catch(() => undefined);
+    await Promise.all([
+      operation?.catch(() => undefined),
+      fileTranscription.shutdown().catch(() => undefined),
+    ]);
 
     const active = recording;
     recording = undefined;

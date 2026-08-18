@@ -21,6 +21,7 @@ pi install npm:@earendil-works/pi-transcribe
 The extension registers:
 
 - a configurable terminal shortcut (`Ctrl+Alt+Z` by default) to start and stop recording;
+- a `transcribe_file` tool that the agent can use to transcribe local audio or video files;
 - `/transcribe` for model, transcription-language, microphone, and shortcut settings.
 
 To develop or run it from a checkout:
@@ -31,3 +32,26 @@ pi -e /absolute/path/to/pi-transcribe
 ```
 
 Press the shortcut while Pi has focus, speak, then press it again. A live level meter appears above the editor while recording. `Esc` cancels. Audio is transcribed locally and inserted at the editor cursor. The shortcut is a Pi terminal binding, not a global OS hotkey.
+
+## File transcription and FFmpeg
+
+The agent can call `transcribe_file` for local audio or video files. File decoding requires the `ffmpeg` executable; microphone dictation does not. Install FFmpeg with your system package manager:
+
+```bash
+# macOS with Homebrew
+brew install ffmpeg
+
+# Debian or Ubuntu
+sudo apt install ffmpeg
+
+# Windows with winget
+winget install Gyan.FFmpeg
+```
+
+If FFmpeg is installed outside `PATH`, point pi-transcribe at it before starting Pi:
+
+```bash
+export PI_TRANSCRIBE_FFMPEG_PATH=/path/to/ffmpeg
+```
+
+When FFmpeg is unavailable, `transcribe_file` reports platform-specific guidance to the agent. The agent should ask before running a package-manager command. Model setup is still explicit: run `/transcribe` once in the interactive TUI to choose and, after confirmation, download a local model.
