@@ -2,23 +2,19 @@ import { TranscribeModel } from "transcribe-cpp";
 import { convertChineseOutput, isChineseLanguage } from "./chinese.js";
 import type { ChineseOutput } from "./settings.js";
 
-export interface TranscriptionBackend {
-  prepare(): Promise<void>;
-  transcribe(pcm: Float32Array, signal?: AbortSignal): Promise<string>;
-  dispose(): Promise<void>;
-}
+export type TranscriptionOptions = {
+  signal?: AbortSignal;
+  language?: string;
+  chineseOutput?: ChineseOutput;
+};
 
-/** Local transcribe.cpp backend. A future IPC backend can implement the same small contract. */
-export class TranscribeCppBackend implements TranscriptionBackend {
+/** A reusable loaded transcribe.cpp model. Calls must be scheduled sequentially. */
+export class TranscribeCppBackend {
   private model: TranscribeModel | undefined;
   private loading: Promise<TranscribeModel> | undefined;
   private disposed = false;
 
-  constructor(
-    private readonly modelPath: string,
-    private readonly language?: string,
-    private readonly chineseOutput: ChineseOutput = "simplified",
-  ) {}
+  constructor(private readonly modelPath: string) {}
 
   async prepare(): Promise<void> {
     if (this.model) return;
@@ -29,15 +25,6 @@ export class TranscribeCppBackend implements TranscriptionBackend {
         if (this.disposed) {
           model.dispose();
           throw new Error("Transcription backend was disposed while loading");
-        }
-        if (
-          this.language &&
-          !model.capabilities.languages.includes(this.language)
-        ) {
-          model.dispose();
-          throw new Error(
-            `Configured language ${this.language} is not supported by this model. Open /transcribe and choose another language.`,
-          );
         }
         this.model = model;
         return model;
@@ -51,17 +38,27 @@ export class TranscribeCppBackend implements TranscriptionBackend {
     }
   }
 
-  async transcribe(pcm: Float32Array, signal?: AbortSignal): Promise<string> {
-    if (pcm.length === 0) throw new Error("No microphone samples were captured");
+  async transcribe(
+    pcm: Float32Array,
+    options: TranscriptionOptions = {},
+  ): Promise<string> {
+    if (pcm.length === 0) throw new Error("No audio samples were provided");
     await this.prepare();
-    const result = await this.model!.transcribe(pcm, {
-      signal,
+    const model = this.model!;
+    if (options.language && !model.capabilities.languages.includes(options.language)) {
+      throw new Error(
+        `Configured language ${options.language} is not supported by this model. Open /transcribe and choose another language.`,
+      );
+    }
+
+    const result = await model.transcribe(pcm, {
+      signal: options.signal,
       timestamps: "none",
-      ...(this.language ? { language: this.language } : {}),
+      ...(options.language ? { language: options.language } : {}),
     });
     const text = result.text.trim();
-    return isChineseLanguage(result.language || this.language || "")
-      ? convertChineseOutput(text, this.chineseOutput)
+    return isChineseLanguage(result.language || options.language || "")
+      ? convertChineseOutput(text, options.chineseOutput ?? "simplified")
       : text;
   }
 

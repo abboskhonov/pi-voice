@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 export const FILE_SAMPLE_RATE = 16_000;
 
 const BYTES_PER_SAMPLE = Float32Array.BYTES_PER_ELEMENT;
-const MAX_DECODED_BYTES = 512 * 1024 * 1024;
+const MAX_DECODED_BYTES = 128 * 1024 * 1024;
 const MAX_STDERR_CHARS = 8 * 1024;
 
 function ffmpegExecutable(): string {
@@ -100,7 +100,7 @@ export async function decodeFileAudio(
       byteLength += chunk.length;
       if (byteLength > MAX_DECODED_BYTES) {
         terminalError = new Error(
-          "Decoded audio exceeds the 512 MiB safety limit (about 2 hours 20 minutes at 16 kHz mono). Split the media file into smaller parts and retry.",
+          "Decoded audio exceeds the 128 MiB safety limit (about 35 minutes at 16 kHz mono). Split the media file into smaller parts and retry.",
         );
         child.kill("SIGTERM");
         return;

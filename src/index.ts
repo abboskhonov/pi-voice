@@ -20,7 +20,10 @@ import {
   showSettingsMenu,
 } from "./settings-menu.js";
 import { displayShortcut } from "./shortcuts.js";
-import { TranscribeCppBackend, type TranscriptionBackend } from "./transcription.js";
+import {
+  TranscriptionService,
+  type DictationReservation,
+} from "./transcription-service.js";
 import {
   clearTranscribeWidget,
   RecordingMeter,
@@ -29,8 +32,7 @@ import {
 
 type ActiveRecording = {
   capture: MicrophoneCapture;
-  backend: TranscriptionBackend;
-  preparation: Promise<void>;
+  reservation: DictationReservation;
   meter: RecordingMeter;
 };
 
@@ -58,7 +60,7 @@ export default function piTranscribe(pi: ExtensionAPI): void {
   let settingsLoaded = false;
   let settingsReadWarning: string | undefined;
   let settingsWarningShown = false;
-  let fileTranscriptionBusy: () => boolean = () => false;
+  const transcriptionService = new TranscriptionService();
 
   function rememberSettings(configured: TranscribeSettings): void {
     settings = configured;
@@ -182,7 +184,7 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     } catch {
       // Discarded either way.
     } finally {
-      await active.backend.dispose().catch(() => undefined);
+      active.reservation.cancel();
       clearCancelListener();
       ctx.ui.notify("Recording discarded", "info");
     }
@@ -200,6 +202,7 @@ export default function piTranscribe(pi: ExtensionAPI): void {
         const audio = await active.capture.stop();
         pcm = audio.pcm;
       } catch (error) {
+        active.reservation.cancel();
         ctx.ui.notify(captureErrorMessage(error), "error");
         if (!(error instanceof MicrophoneUnavailableError)) {
           await offerMacOSPermissionHelp(pi, ctx);
@@ -211,11 +214,8 @@ export default function piTranscribe(pi: ExtensionAPI): void {
       transcriptionAbort = controller;
 
       try {
-        showTranscribeStatus(ctx, "waiting for model", { cancelable: true });
-        await active.preparation;
-
-        showTranscribeStatus(ctx, "transcribing", { cancelable: true });
-        const text = await active.backend.transcribe(pcm, controller.signal);
+        showTranscribeStatus(ctx, "waiting to transcribe", { cancelable: true });
+        const text = await active.reservation.submit(pcm, controller.signal);
         const seconds = pcm.length / CAPTURE_SAMPLE_RATE;
 
         if (text) {
@@ -232,13 +232,8 @@ export default function piTranscribe(pi: ExtensionAPI): void {
         if (transcriptionAbort === controller) transcriptionAbort = undefined;
       }
     } finally {
-      showTranscribeStatus(ctx, "unloading model");
-      try {
-        await active.backend.dispose();
-      } finally {
-        clearCancelListener();
-        clearTranscribeWidget(ctx);
-      }
+      clearCancelListener();
+      clearTranscribeWidget(ctx);
     }
   }
 
@@ -281,18 +276,19 @@ export default function piTranscribe(pi: ExtensionAPI): void {
       return;
     }
 
-    const backend = new TranscribeCppBackend(
-      configured.model.path,
-      configured.transcriptionLanguage === "auto"
-        ? undefined
-        : configured.transcriptionLanguage,
-      configured.chineseOutput,
-    );
-    const preparation = backend.prepare();
-    const active: ActiveRecording = { capture, backend, preparation, meter };
+    let reservation: DictationReservation;
+    try {
+      reservation = transcriptionService.reserveDictation(configured);
+    } catch (error) {
+      meter.stop();
+      await capture.stop().catch(() => undefined);
+      ctx.ui.notify(transcriptionErrorMessage(error), "error");
+      return;
+    }
+    const active: ActiveRecording = { capture, reservation, meter };
     recording = active;
 
-    void preparation.then(
+    void reservation.ready.then(
       () => {
         if (recording === active) active.meter.setModelState("ready");
       },
@@ -319,10 +315,6 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     task: () => Promise<void>,
   ): Promise<void> {
-    if (fileTranscriptionBusy()) {
-      ctx.ui.notify("A file transcription is already in progress", "warning");
-      return Promise.resolve();
-    }
     if (operation) {
       ctx.ui.notify("A pi-transcribe operation is already in progress", "warning");
       return operation;
@@ -337,9 +329,8 @@ export default function piTranscribe(pi: ExtensionAPI): void {
 
   const fileTranscription = registerFileTranscriptionTool(pi, {
     getSettings: requireConfiguredSettingsForTool,
-    isDictationBusy: () => Boolean(recording || operation),
+    service: transcriptionService,
   });
-  fileTranscriptionBusy = fileTranscription.isBusy;
 
   pi.registerShortcut(
     registeredShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0],
@@ -378,15 +369,16 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     await Promise.all([
       operation?.catch(() => undefined),
       fileTranscription.shutdown().catch(() => undefined),
+      transcriptionService.shutdown().catch(() => undefined),
     ]);
 
     const active = recording;
     recording = undefined;
     clearCancelListener();
     if (active) {
+      active.reservation.cancel();
       active.meter.stop();
       await active.capture.stop().catch(() => undefined);
-      await active.backend.dispose();
     }
     clearTranscribeWidget(ctx);
   });

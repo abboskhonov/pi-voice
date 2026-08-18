@@ -35,7 +35,7 @@ Press the shortcut while Pi has focus, speak, then press it again. A live level 
 
 ## File transcription and FFmpeg
 
-The agent can call `transcribe_file` for local audio or video files. File decoding requires the `ffmpeg` executable; microphone dictation does not. Install FFmpeg with your system package manager:
+The agent can call `transcribe_file` for local audio or video files. Transcription jobs share one loaded model; queued files reuse it, while microphone dictation runs before waiting file jobs after any active job finishes. To bound memory use, at most two file operations are admitted at once, only one FFmpeg decoder runs at a time, and decoded audio is limited to 128 MiB (about 35 minutes). File decoding requires the `ffmpeg` executable; microphone dictation does not. Install FFmpeg with your system package manager:
 
 ```bash
 # macOS with Homebrew
