@@ -1,5 +1,4 @@
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -9,7 +8,7 @@ import {
   modelSupportsLanguage,
   type CatalogModel,
 } from "./catalog.js";
-import { DEFAULT_SHORTCUT, normalizeShortcut } from "./shortcuts.js";
+import { DEFAULT_SHORTCUT, normalizeShortcut } from "./shortcut-core.js";
 
 const SETTINGS_VERSION = 1;
 
@@ -153,15 +152,6 @@ function validateSettings(value: unknown): TranscribeSettings | undefined {
       path: value.model.path,
     },
   };
-}
-
-export function readShortcutForRegistration(): string {
-  try {
-    const settings = validateSettings(JSON.parse(readFileSync(settingsPath(), "utf8")) as unknown);
-    return settings?.shortcut ?? DEFAULT_SHORTCUT;
-  } catch {
-    return DEFAULT_SHORTCUT;
-  }
 }
 
 export async function readSettings(): Promise<SettingsReadResult> {

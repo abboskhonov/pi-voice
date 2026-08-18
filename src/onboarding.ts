@@ -31,7 +31,7 @@ import {
   type TranscribeSettings,
   type TranscriptionLanguage,
 } from "./settings.js";
-import { DEFAULT_SHORTCUT } from "./shortcuts.js";
+import { DEFAULT_SHORTCUT } from "./shortcut-core.js";
 
 type UiTheme = ExtensionContext["ui"]["theme"];
 

@@ -11,7 +11,6 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Type } from "typebox";
 import { AsyncLimiter } from "./async-limiter.js";
-import { decodeFileAudio } from "./file-audio.js";
 import type { TranscribeSettings } from "./settings.js";
 import type { TranscriptionService } from "./transcription-service.js";
 
@@ -29,7 +28,7 @@ type FileTranscriptionDetails = {
 
 type FileTranscriptionOptions = {
   getSettings: () => Promise<TranscribeSettings>;
-  service: TranscriptionService;
+  getService: () => Promise<TranscriptionService>;
 };
 
 export type FileTranscriptionController = {
@@ -117,6 +116,7 @@ export function registerFileTranscriptionTool(
           operationSignal.throwIfAborted();
 
           const configured = await options.getSettings();
+          const service = await options.getService();
           if (fileOperations.saturated) {
             onUpdate?.({
               content: [{ type: "text", text: "Waiting for file transcription capacity…" }],
@@ -136,6 +136,7 @@ export function registerFileTranscriptionTool(
                 content: [{ type: "text", text: `Decoding ${basename(inputPath)} with FFmpeg…` }],
                 details: { inputPath, modelId: configured.model.id, seconds: 0 },
               });
+              const { decodeFileAudio } = await import("./file-audio.js");
               return decodeFileAudio(inputPath, operationSignal);
             }, operationSignal);
 
@@ -152,7 +153,7 @@ export function registerFileTranscriptionTool(
                 seconds: audio.seconds,
               },
             });
-            const transcript = await options.service.transcribeFile(
+            const transcript = await service.transcribeFile(
               configured,
               audio.pcm,
               operationSignal,

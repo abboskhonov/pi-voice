@@ -13,7 +13,8 @@ import {
   type MicrophoneSetting,
   type TranscribeSettings,
 } from "./settings.js";
-import { chooseShortcut, displayShortcut } from "./shortcuts.js";
+import { displayShortcut } from "./shortcut-core.js";
+import { chooseShortcut } from "./shortcuts.js";
 
 const MACOS_MICROPHONE_SETTINGS_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";

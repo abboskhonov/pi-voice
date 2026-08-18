@@ -1,19 +1,43 @@
-import OpenCC from "opencc-js";
 import type { ChineseOutput } from "./settings.js";
 
-const converters = {
-  simplified: OpenCC.Converter({ from: "t", to: "cn" }),
-  "traditional-taiwan": OpenCC.Converter({ from: "cn", to: "tw" }),
-  "traditional-hong-kong": OpenCC.Converter({ from: "cn", to: "hk" }),
-} satisfies Record<ChineseOutput, (text: string) => string>;
+type Converter = (text: string) => string;
+
+const converters = new Map<ChineseOutput, Promise<Converter>>();
+
+async function createConverter(output: ChineseOutput): Promise<Converter> {
+  const { default: OpenCC } = await import("opencc-js");
+  switch (output) {
+    case "simplified":
+      return OpenCC.Converter({ from: "t", to: "cn" });
+    case "traditional-taiwan":
+      return OpenCC.Converter({ from: "cn", to: "tw" });
+    case "traditional-hong-kong":
+      return OpenCC.Converter({ from: "cn", to: "hk" });
+  }
+}
+
+function converterFor(output: ChineseOutput): Promise<Converter> {
+  const existing = converters.get(output);
+  if (existing) return existing;
+
+  const loading = createConverter(output);
+  converters.set(output, loading);
+  void loading.catch(() => {
+    if (converters.get(output) === loading) converters.delete(output);
+  });
+  return loading;
+}
 
 export function isChineseLanguage(language: string): boolean {
   const base = language.toLowerCase().split("-", 1)[0];
   return base === "zh" || base === "yue";
 }
 
-export function convertChineseOutput(text: string, output: ChineseOutput): string {
-  return converters[output](text);
+export async function convertChineseOutput(
+  text: string,
+  output: ChineseOutput,
+): Promise<string> {
+  return (await converterFor(output))(text);
 }
 
 export function chineseOutputSummary(output: ChineseOutput): string {

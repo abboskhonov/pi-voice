@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CAPTURE_SAMPLE_RATE } from "./audio.js";
+import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 
 const WIDGET_KEY = "pi-transcribe-meter";
 const UPDATE_MS = 50;

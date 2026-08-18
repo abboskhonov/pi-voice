@@ -1,5 +1,5 @@
 import type { TranscribeSettings } from "./settings.js";
-import { TranscribeCppBackend } from "./transcription.js";
+import type { TranscribeCppBackend } from "./transcription.js";
 
 type JobPriority = "dictation" | "file";
 
@@ -32,7 +32,9 @@ export type DictationReservation = {
 };
 
 type ReusableBackend = Pick<TranscribeCppBackend, "prepare" | "transcribe" | "dispose">;
-type BackendFactory = (modelPath: string) => ReusableBackend;
+type BackendFactory = (
+  modelPath: string,
+) => ReusableBackend | Promise<ReusableBackend>;
 
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Transcription cancelled");
@@ -50,8 +52,10 @@ export class TranscriptionService {
   private readonly shutdownController = new AbortController();
 
   constructor(
-    private readonly createBackend: BackendFactory = (modelPath) =>
-      new TranscribeCppBackend(modelPath),
+    private readonly createBackend: BackendFactory = async (modelPath) => {
+      const { TranscribeCppBackend } = await import("./transcription.js");
+      return new TranscribeCppBackend(modelPath);
+    },
   ) {}
 
   reserveDictation(settings: TranscribeSettings): DictationReservation {
@@ -247,7 +251,7 @@ export class TranscriptionService {
     }
 
     await this.unloadModel();
-    const backend = this.createBackend(modelPath);
+    const backend = await this.createBackend(modelPath);
     this.backend = backend;
     this.modelPath = modelPath;
     try {

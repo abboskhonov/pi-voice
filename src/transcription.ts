@@ -1,4 +1,4 @@
-import { TranscribeModel } from "transcribe-cpp";
+import type { TranscribeModel } from "transcribe-cpp";
 import { convertChineseOutput, isChineseLanguage } from "./chinese.js";
 import type { ChineseOutput } from "./settings.js";
 
@@ -21,14 +21,16 @@ export class TranscribeCppBackend {
     if (this.disposed) throw new Error("Transcription backend has been disposed");
 
     if (!this.loading) {
-      this.loading = TranscribeModel.load(this.modelPath).then((model) => {
-        if (this.disposed) {
-          model.dispose();
-          throw new Error("Transcription backend was disposed while loading");
-        }
-        this.model = model;
-        return model;
-      });
+      this.loading = import("transcribe-cpp")
+        .then(({ TranscribeModel }) => TranscribeModel.load(this.modelPath))
+        .then((model) => {
+          if (this.disposed) {
+            model.dispose();
+            throw new Error("Transcription backend was disposed while loading");
+          }
+          this.model = model;
+          return model;
+        });
     }
 
     try {
@@ -58,7 +60,7 @@ export class TranscribeCppBackend {
     });
     const text = result.text.trim();
     return isChineseLanguage(result.language || options.language || "")
-      ? convertChineseOutput(text, options.chineseOutput ?? "simplified")
+      ? await convertChineseOutput(text, options.chineseOutput ?? "simplified")
       : text;
   }
 

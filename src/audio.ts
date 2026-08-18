@@ -1,8 +1,10 @@
 import { PvRecorder } from "@picovoice/pvrecorder-node";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 
-export const CAPTURE_SAMPLE_RATE = 16_000;
+export { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
+
 const FRAME_LENGTH = 512;
 
 const execFileAsync = promisify(execFile);
