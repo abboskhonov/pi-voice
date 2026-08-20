@@ -230,7 +230,7 @@ export function createPiTranscribeRuntime(
       transcriptionAbort = controller;
 
       try {
-        showTranscribeStatus(ctx, "waiting to transcribe", { cancelable: true });
+        showTranscribeStatus(ctx, "Transcribing...", { cancelable: true, spinner: true });
         const text = await active.reservation.submit(pcm, controller.signal);
         const seconds = pcm.length / CAPTURE_SAMPLE_RATE;
 

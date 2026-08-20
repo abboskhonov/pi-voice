@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Loader } from "@earendil-works/pi-tui";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 
 const WIDGET_KEY = "pi-transcribe-meter";
@@ -105,12 +106,38 @@ function formatElapsed(ms: number): string {
 export function showTranscribeStatus(
   ctx: ExtensionContext,
   text: string,
-  options?: { cancelable?: boolean },
+  options?: { cancelable?: boolean; spinner?: boolean },
 ): void {
   if (!ctx.hasUI) return;
-  const theme = ctx.ui.theme;
-  const hint = options?.cancelable ? `  ${theme.fg("dim", "esc to cancel")}` : "";
-  ctx.ui.setWidget(WIDGET_KEY, [`${theme.fg("muted", text)}${hint}`]);
+
+  if (!options?.spinner) {
+    const theme = ctx.ui.theme;
+    const hint = options?.cancelable ? `  ${theme.fg("dim", "esc to cancel")}` : "";
+    ctx.ui.setWidget(WIDGET_KEY, [`${theme.fg("muted", text)}${hint}`]);
+    return;
+  }
+
+  ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
+    const message = () =>
+      `${theme.fg("muted", text)}${options.cancelable ? `  ${theme.fg("dim", "esc to cancel")}` : ""}`;
+    const loader = new Loader(
+      tui,
+      (frame) => theme.fg("accent", frame),
+      (value) => value,
+      message(),
+    );
+
+    return {
+      render: (width: number) => loader.render(width),
+      invalidate(): void {
+        loader.invalidate();
+        loader.setMessage(message());
+      },
+      dispose(): void {
+        loader.stop();
+      },
+    };
+  });
 }
 
 export function clearTranscribeWidget(ctx: ExtensionContext): void {
