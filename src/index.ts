@@ -42,6 +42,13 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => (await loadRuntime()).showSettings(ctx),
   });
 
+  if (process.env.PI_TRANSCRIBE_DEBUG === "1") {
+    pi.registerCommand("transcribe-onboarding", {
+      description: "Replay pi-transcribe onboarding (debug)",
+      handler: async (_args, ctx) => (await loadRuntime()).replayOnboarding(ctx),
+    });
+  }
+
   pi.on("session_shutdown", async (_event, ctx) => {
     shuttingDown = true;
     await fileTranscription.shutdown().catch(() => undefined);

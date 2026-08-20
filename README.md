@@ -22,7 +22,7 @@ The extension registers:
 
 - a configurable terminal shortcut (`Ctrl+Alt+Z` by default) to start and stop recording;
 - a `transcribe_file` tool that the agent can use to transcribe local audio or video files;
-- `/transcribe` for model, transcription-language, microphone, and shortcut settings.
+- `/transcribe` for preferred languages, model, transcription language, microphone, and shortcut settings.
 
 To develop or run it from a checkout:
 
@@ -30,6 +30,14 @@ To develop or run it from a checkout:
 npm install --ignore-scripts
 pi -e /absolute/path/to/pi-transcribe
 ```
+
+While iterating on setup, enable the debug-only onboarding command when starting Pi:
+
+```bash
+PI_TRANSCRIBE_DEBUG=1 pi -e /absolute/path/to/pi-transcribe
+```
+
+Then run `/transcribe-onboarding` to replay the complete onboarding flow. The command is not registered unless `PI_TRANSCRIBE_DEBUG=1`. Canceling before selecting a model leaves the current configuration unchanged; model selections are applied immediately.
 
 Press the shortcut while Pi has focus, speak, then press it again. A live level meter appears above the editor while recording. `Esc` cancels. Audio is transcribed locally and inserted at the editor cursor. The shortcut is a Pi terminal binding, not a global OS hotkey.
 

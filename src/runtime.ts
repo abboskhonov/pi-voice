@@ -26,6 +26,7 @@ export type PiTranscribeRuntime = {
   requireConfiguredSettingsForTool(): Promise<TranscribeSettings>;
   toggleCapture(ctx: ExtensionContext): Promise<void>;
   showSettings(ctx: ExtensionCommandContext): Promise<void>;
+  replayOnboarding(ctx: ExtensionCommandContext): Promise<void>;
   shutdown(ctx: ExtensionContext): Promise<void>;
 };
 
@@ -373,6 +374,28 @@ export function createPiTranscribeRuntime(
     }
   }
 
+  async function replayOnboarding(ctx: ExtensionCommandContext): Promise<void> {
+    if (recording) {
+      ctx.ui.notify(
+        `Stop recording with ${displayShortcut(registeredShortcut)} before replaying onboarding`,
+        "warning",
+      );
+      return;
+    }
+
+    await runExclusive(ctx, async () => {
+      await loadSettingsOnce();
+      const { runOnboarding } = await import("./onboarding.js");
+      const configured = await runOnboarding(
+        ctx,
+        settings?.shortcut ?? registeredShortcut,
+      );
+      if (!configured) return;
+      rememberSettings(configured);
+      ctx.ui.notify("Onboarding replay complete", "info");
+    });
+  }
+
   async function shutdown(ctx: ExtensionContext): Promise<void> {
     transcriptionAbort?.abort();
     await Promise.all([
@@ -399,6 +422,7 @@ export function createPiTranscribeRuntime(
     requireConfiguredSettingsForTool,
     toggleCapture,
     showSettings,
+    replayOnboarding,
     shutdown,
   };
 }
