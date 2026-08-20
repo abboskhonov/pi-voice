@@ -5,22 +5,14 @@ import {
   getRepoFolderName,
 } from "@huggingface/hub";
 import { createHash, randomUUID } from "node:crypto";
-import {
-  createReadStream,
-  createWriteStream,
-  existsSync,
-  statSync,
-} from "node:fs";
+import { createWriteStream, existsSync, statSync } from "node:fs";
 import {
   copyFile,
-  lstat,
   mkdir,
-  realpath,
   rename,
   rm,
   stat,
   symlink,
-  unlink,
 } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { Readable, Transform } from "node:stream";
@@ -56,49 +48,10 @@ export function findCachedCatalogModel(model: CatalogModel): CachedCatalogModel 
   }
 }
 
-async function sha256(path: string, signal?: AbortSignal): Promise<string> {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path, { signal })) hash.update(chunk);
-  return hash.digest("hex");
-}
-
-async function discardCorruptCacheEntry(path: string): Promise<void> {
-  const blobPath = await realpath(path).catch(() => undefined);
-  await unlink(path).catch(() => undefined);
-  if (blobPath && blobPath !== path) await unlink(blobPath).catch(() => undefined);
-}
-
-export async function verifyCatalogModel(
-  path: string,
-  model: CatalogModel,
-  signal?: AbortSignal,
-): Promise<void> {
-  const fileStat = await stat(path);
-  if (fileStat.size !== model.size) {
-    await discardCorruptCacheEntry(path);
-    throw new Error(
-      `${model.name} size mismatch: expected ${model.size} bytes, received ${fileStat.size}`,
-    );
-  }
-
-  const digest = await sha256(path, signal);
-  if (digest !== model.sha256) {
-    await discardCorruptCacheEntry(path);
-    throw new Error(`${model.name} SHA-256 mismatch; corrupt cached bytes were removed`);
-  }
-}
-
 type DownloadProgress = {
   downloaded: number;
   total: number;
 };
-
-async function exists(path: string): Promise<boolean> {
-  return lstat(path).then(
-    () => true,
-    () => false,
-  );
-}
 
 async function createCacheLink(blobPath: string, pointerPath: string): Promise<void> {
   await rm(pointerPath, { force: true });
@@ -148,10 +101,15 @@ export async function downloadCatalogModel(
   // Match Hugging Face's standard cache key for these LFS-backed model files.
   const etag = info.etag.replace(/^W\//, "").replace(/^"|"$/g, "");
   const blobPath = join(storage, "blobs", etag);
+  // The blob key names this exact content (the size was checked against the
+  // catalog above), so a blob of any other size is a broken write by another
+  // cache user and is replaced by a fresh download.
+  const blobUsable = (): Promise<boolean> =>
+    stat(blobPath).then((value) => value.size === model.size, () => false);
   await mkdir(dirname(blobPath), { recursive: true });
   await mkdir(dirname(pointerPath), { recursive: true });
 
-  if (await exists(blobPath)) {
+  if (await blobUsable()) {
     await createCacheLink(blobPath, pointerPath);
     onProgress?.({ downloaded: model.size, total: model.size });
     return pointerPath;
@@ -172,9 +130,11 @@ export async function downloadCatalogModel(
 
   let downloaded = 0;
   let lastReport = 0;
+  const digest = createHash("sha256");
   const progress = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       downloaded += chunk.length;
+      digest.update(chunk);
       const now = Date.now();
       if (now - lastReport >= 100 || downloaded === blob.size) {
         lastReport = now;
@@ -195,19 +155,20 @@ export async function downloadCatalogModel(
     signal?.throwIfAborted();
 
     const incompleteStat = await stat(incompletePath);
-    if (incompleteStat.size !== model.size || (await sha256(incompletePath, signal)) !== model.sha256) {
+    if (incompleteStat.size !== model.size || digest.digest("hex") !== model.sha256) {
       throw new Error(`${model.name} verification failed; incomplete bytes were removed`);
     }
     signal?.throwIfAborted();
 
-    if (await exists(blobPath)) {
+    if (await blobUsable()) {
       await rm(incompletePath, { force: true });
     } else {
       try {
+        // rename() replaces a wrong-size blob left by an interrupted writer.
         await rename(incompletePath, blobPath);
       } catch (error) {
         // Another process may have published the same verified blob first.
-        if (!(await exists(blobPath))) throw error;
+        if (!(await blobUsable())) throw error;
         await rm(incompletePath, { force: true });
       }
     }

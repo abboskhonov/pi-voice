@@ -1,17 +1,4 @@
-import {
-  BorderedLoader,
-  DynamicBorder,
-  keyHint,
-  type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
-import {
-  CancellableLoader,
-  Container,
-  Spacer,
-  Text,
-  type TUI,
-} from "@earendil-works/pi-tui";
-import { formatBinarySize } from "./catalog.js";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   chooseCatalogModel,
   chooseLanguages,
@@ -20,7 +7,6 @@ import {
 import {
   downloadCatalogModel,
   findCachedCatalogModel,
-  verifyCatalogModel,
 } from "./models.js";
 import {
   DEFAULT_MICROPHONE,
@@ -32,49 +18,6 @@ import {
   type TranscriptionLanguage,
 } from "./settings.js";
 import { DEFAULT_SHORTCUT } from "./shortcut-core.js";
-
-type UiTheme = ExtensionContext["ui"]["theme"];
-
-class DownloadLoader extends Container {
-  private readonly loader: CancellableLoader;
-
-  constructor(tui: TUI, theme: UiTheme, message: string) {
-    super();
-    const border = (text: string) => theme.fg("border", text);
-    this.loader = new CancellableLoader(
-      tui,
-      (text) => theme.fg("accent", text),
-      (text) => theme.fg("muted", text),
-      message,
-    );
-    this.addChild(new DynamicBorder(border));
-    this.addChild(this.loader);
-    this.addChild(new Spacer(1));
-    this.addChild(new Text(keyHint("tui.select.cancel", "cancel"), 1, 0));
-    this.addChild(new Spacer(1));
-    this.addChild(new DynamicBorder(border));
-  }
-
-  get signal(): AbortSignal {
-    return this.loader.signal;
-  }
-
-  set onAbort(callback: (() => void) | undefined) {
-    this.loader.onAbort = callback;
-  }
-
-  setMessage(message: string): void {
-    this.loader.setMessage(message);
-  }
-
-  handleInput(data: string): void {
-    this.loader.handleInput(data);
-  }
-
-  dispose(): void {
-    this.loader.dispose();
-  }
-}
 
 function requireTui(ctx: ExtensionContext): boolean {
   if (ctx.mode === "tui") return true;
@@ -90,6 +33,7 @@ type ModelSelectionOptions = {
   currentModelId?: string;
   microphone?: MicrophoneSetting;
   onPreferredLanguagesChange?: (languages: string[]) => Promise<void>;
+  continueAfterSelection?: boolean;
 };
 
 export async function runModelSelection(
@@ -101,115 +45,100 @@ export async function runModelSelection(
   let preferredLanguages = [
     ...(options.preferredLanguages ?? defaultSpokenLanguages()),
   ];
+  let currentModelId = options.currentModelId;
+  let configured: TranscribeSettings | undefined;
+  // Back-to-back selections can outrun their settings writes. Commits run in
+  // selection order, so the file always ends on the user's last choice.
+  let commitQueue: Promise<void> = Promise.resolve();
+  const enqueueCommit = (commit: () => Promise<void>): Promise<void> => {
+    const result = commitQueue.then(commit);
+    commitQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+
   while (true) {
     const selection = await chooseCatalogModel(
       ctx,
       preferredLanguages,
-      options.currentModelId,
-    );
-    if (!selection) return undefined;
-    if (selection.type === "change-languages") {
-      const changed = await chooseLanguages(ctx, preferredLanguages);
-      if (changed) {
-        try {
-          await options.onPreferredLanguagesChange?.(changed);
-          preferredLanguages = changed;
-        } catch (error) {
-          ctx.ui.notify(
-            `Could not save preferred languages: ${error instanceof Error ? error.message : String(error)}`,
-            "error",
-          );
-        }
-      }
-      continue;
-    }
-
-    const model = selection.model;
-    const cached = findCachedCatalogModel(model);
-    if (!cached) {
-      const confirmed = await ctx.ui.confirm(
-        model.name,
-        [
-          `Download ${formatBinarySize(model.size)} (${model.quant}) from Hugging Face?`,
-          `License: ${model.license}`,
-          "Audio never leaves this machine.",
-        ].join("\n"),
-      );
-      if (!confirmed) return undefined;
-    }
-
-    let prepared: { path: string } | { error: unknown } | { cancelled: true };
-    prepared = await ctx.ui.custom<
-      { path: string } | { error: unknown } | { cancelled: true }
-    >((tui, theme, _keybindings, done) => {
-      const detail = `${model.quant} · ${formatBinarySize(model.size)}`;
-      const loader = cached
-        ? new BorderedLoader(tui, theme, `Verifying ${model.name} · ${detail}`)
-        : new DownloadLoader(tui, theme, `Downloading ${model.name} · ${detail}`);
-      loader.onAbort = () => {
-        if (loader instanceof DownloadLoader) loader.setMessage(`Cancelling ${model.name}`);
-      };
-
-      void (async () => {
-        try {
+      currentModelId,
+      {
+        continueAfterActivation: options.continueAfterSelection,
+        // Keep the post-selection affordances when the picker reopens after a
+        // round-trip through the language step.
+        alreadyActivated: configured !== undefined,
+        onActivate: async (model, { cached, signal, onProgress }) => {
           let path: string;
           if (cached) {
-            path = cached.path;
+            // The picker listed the cache when it opened; re-check so settings
+            // never point at a file that has since been evicted. Integrity is
+            // covered by the download-time hash and the size check here.
+            const stillCached = findCachedCatalogModel(model);
+            if (!stillCached) {
+              throw new Error(
+                "the downloaded file is missing; select the model again to re-download it",
+              );
+            }
+            path = stillCached.path;
           } else {
-            path = await downloadCatalogModel(model, {
-              signal: loader.signal,
-              onProgress: ({ downloaded, total }) => {
-                const percent = total > 0 ? Math.floor((downloaded / total) * 100) : 0;
-                const message = `Downloading ${model.name} · ${formatBinarySize(downloaded)} / ${formatBinarySize(total)} · ${percent}%`;
-                if (loader instanceof DownloadLoader) loader.setMessage(message);
-              },
-            });
+            path = await downloadCatalogModel(model, { signal, onProgress });
+            // Esc during the download tail cancels the selection even though
+            // the bytes are already cached.
+            signal.throwIfAborted();
           }
 
-          if (loader.signal.aborted) {
-            done({ cancelled: true });
-            return;
-          }
-          if (loader instanceof DownloadLoader) {
-            loader.setMessage(`Verifying ${model.name} · ${detail}`);
-          }
-          await verifyCatalogModel(path, model, loader.signal);
-          done({ path });
-        } catch (error) {
-          done(loader.signal.aborted ? { cancelled: true } : { error });
+          await enqueueCommit(async () => {
+            // Skip the write when this selection was superseded or its
+            // download was cancelled while the commit sat in the queue.
+            signal.throwIfAborted();
+            let settings: TranscribeSettings;
+            try {
+              settings = settingsForModel(model.id, path, {
+                shortcut: configured?.shortcut ?? options.shortcut ?? DEFAULT_SHORTCUT,
+                preferredLanguages,
+                transcriptionLanguage:
+                  configured?.transcriptionLanguage ?? options.transcriptionLanguage,
+                chineseOutput: configured?.chineseOutput ?? options.chineseOutput,
+                microphone: configured?.microphone ?? options.microphone ?? DEFAULT_MICROPHONE,
+              });
+              await writeSettings(settings);
+            } catch (error) {
+              throw new Error(
+                `Could not save settings: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+            configured = settings;
+            currentModelId = model.id;
+          });
+          return { path };
+        },
+      },
+    );
+    // The picker can close while its last commit is still in flight; wait so
+    // configured reflects every selection that will land on disk.
+    await commitQueue;
+
+    if (!selection || selection.type === "complete") return configured;
+
+    // Esc and Continue both keep the selection here; the picker edits live
+    // state rather than gating it behind a confirm.
+    const changed = await chooseLanguages(ctx, preferredLanguages);
+    if (changed) {
+      try {
+        await options.onPreferredLanguagesChange?.(changed.languages);
+        preferredLanguages = changed.languages;
+        if (configured) {
+          configured = { ...configured, preferredLanguages };
+          await writeSettings(configured);
         }
-      })();
-      return loader;
-    });
-
-    if ("cancelled" in prepared) continue;
-
-    if ("error" in prepared) {
-      ctx.ui.notify(
-        `Could not prepare ${model.name}: ${prepared.error instanceof Error ? prepared.error.message : String(prepared.error)}`,
-        "error",
-      );
-      // Return to model selection so a transient failure does not close setup.
-      continue;
-    }
-
-    try {
-      const settings = settingsForModel(model.id, prepared.path, {
-        shortcut: options.shortcut ?? DEFAULT_SHORTCUT,
-        preferredLanguages,
-        transcriptionLanguage: options.transcriptionLanguage,
-        chineseOutput: options.chineseOutput,
-        microphone: options.microphone ?? DEFAULT_MICROPHONE,
-      });
-      await writeSettings(settings);
-      ctx.ui.notify(`${model.name} is ready for local transcription`, "info");
-      return settings;
-    } catch (error) {
-      ctx.ui.notify(
-        `Could not save ${model.name}: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-      continue;
+      } catch (error) {
+        ctx.ui.notify(
+          `Could not save preferred languages: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
     }
   }
 }
@@ -220,7 +149,23 @@ export async function runOnboarding(
 ): Promise<TranscribeSettings | undefined> {
   if (!requireTui(ctx)) return undefined;
 
-  const preferredLanguages = await chooseLanguages(ctx);
-  if (!preferredLanguages) return undefined;
-  return runModelSelection(ctx, { shortcut, preferredLanguages });
+  let languages = defaultSpokenLanguages();
+  while (true) {
+    const chosen = await chooseLanguages(ctx, languages, { cancelLabel: "skip for now" });
+    // Esc exits onboarding: there are no settings yet for a closed picker's
+    // selection to be kept in, so only Continue advances.
+    if (!chosen?.confirmed) return undefined;
+    languages = chosen.languages;
+    const configured = await runModelSelection(ctx, {
+      shortcut,
+      preferredLanguages: languages,
+      continueAfterSelection: true,
+      onPreferredLanguagesChange: async (changed) => {
+        languages = changed;
+      },
+    });
+    if (configured) return configured;
+    // Cancelling the model picker returns to the language step; only
+    // cancelling the language step exits onboarding.
+  }
 }

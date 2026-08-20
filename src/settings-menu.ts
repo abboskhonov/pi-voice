@@ -1,8 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAvailableMicrophones, testMicrophonePermission } from "./audio.js";
-import { getCatalogModel } from "./catalog.js";
+import { displayLanguage, getCatalogModel } from "./catalog.js";
 import { chineseOutputSummary, isChineseLanguage } from "./chinese.js";
 import {
+  chooseLanguages,
   chooseTranscriptionLanguage,
   transcriptionLanguageSummary,
 } from "./model-picker.js";
@@ -26,6 +27,12 @@ function settingChoice(
   value: string,
 ): string {
   return `${theme.fg("muted", label.padEnd(SETTING_LABEL_WIDTH))}  ${value}`;
+}
+
+function preferredLanguagesSummary(languages: readonly string[]): string {
+  const names = languages.map(displayLanguage);
+  const visible = names.slice(0, 3).join(", ");
+  return names.length > 3 ? `${visible} +${names.length - 3}` : visible;
 }
 
 function microphoneSummary(microphone: MicrophoneSetting): string {
@@ -149,6 +156,11 @@ export async function showSettingsMenu(
     }
 
     const summary = ["pi-transcribe settings", micLine].join("\n");
+    const preferredLanguagesChoice = settingChoice(
+      theme,
+      "Preferred languages",
+      preferredLanguagesSummary(configured.preferredLanguages),
+    );
     const modelChoice = settingChoice(theme, "Model", model.name);
     const languageChoice = settingChoice(
       theme,
@@ -177,6 +189,7 @@ export async function showSettingsMenu(
       configured.preferredLanguages.some(isChineseLanguage);
     const choices = [
       ...(showMicFix ? ["⚠ Fix: open macOS microphone settings"] : []),
+      preferredLanguagesChoice,
       modelChoice,
       languageChoice,
       ...(showChineseOutput ? [chineseOutputChoice] : []),
@@ -191,6 +204,23 @@ export async function showSettingsMenu(
 
     if (choice === "⚠ Fix: open macOS microphone settings") {
       await openMacOSMicrophoneSettings(pi, ctx);
+      continue;
+    }
+    if (choice === preferredLanguagesChoice) {
+      // Esc and Continue both save; the picker edits live state.
+      const selection = await chooseLanguages(ctx, configured.preferredLanguages);
+      const preferredLanguages = selection?.languages;
+      if (
+        !preferredLanguages ||
+        preferredLanguages.join("\0") === configured.preferredLanguages.join("\0")
+      ) {
+        continue;
+      }
+
+      const updated: TranscribeSettings = { ...configured, preferredLanguages };
+      await writeSettings(updated);
+      Object.assign(configured, updated);
+      ctx.ui.notify("Preferred languages saved", "info");
       continue;
     }
     if (choice === modelChoice) {
