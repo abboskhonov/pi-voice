@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerFileTranscriptionTool } from "./file-transcription.js";
 import type { PiTranscribeRuntime } from "./runtime.js";
+import { STATUS_WIDGET_KEY } from "./shortcut-core.js";
 import { readShortcutForRegistration } from "./startup-shortcut.js";
 
 // Pi awaits extension module evaluation before continuing startup. Keep this
@@ -33,7 +34,22 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     registeredShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0],
     {
       description: "Toggle microphone transcription",
-      handler: async (ctx) => (await loadRuntime()).toggleCapture(ctx),
+      handler: async (ctx) => {
+        // The first press pays deferred module loading before the runtime can
+        // show anything; paint feedback synchronously. Later presses reach the
+        // memoized runtime in a microtask and it paints its own status.
+        if (!runtimePromise && ctx.hasUI) {
+          ctx.ui.setWidget(STATUS_WIDGET_KEY, [
+            ctx.ui.theme.fg("muted", "Starting microphone…"),
+          ]);
+        }
+        try {
+          await (await loadRuntime()).toggleCapture(ctx);
+        } catch (error) {
+          if (ctx.hasUI) ctx.ui.setWidget(STATUS_WIDGET_KEY, undefined);
+          throw error;
+        }
+      },
     },
   );
 

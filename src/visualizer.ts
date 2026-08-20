@@ -1,8 +1,9 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
+import { STATUS_WIDGET_KEY } from "./shortcut-core.js";
 
-const WIDGET_KEY = "pi-transcribe-meter";
+const WIDGET_KEY = STATUS_WIDGET_KEY;
 const UPDATE_MS = 50;
 const LEVEL_GAIN = 36;
 const DECAY = 0.65;
@@ -191,8 +192,10 @@ export class RecordingMeter {
     this.paint();
   }
 
-  stop(): void {
-    this.ctx?.ui.setWidget(WIDGET_KEY, undefined);
+  stop(options?: { clearWidget?: boolean }): void {
+    // Callers transitioning to another status on the same slot pass
+    // clearWidget: false so the widget area never collapses between states.
+    if (options?.clearWidget !== false) this.ctx?.ui.setWidget(WIDGET_KEY, undefined);
     this.ctx = undefined;
     this.lastLine = undefined;
   }

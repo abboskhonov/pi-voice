@@ -208,8 +208,11 @@ export function createPiTranscribeRuntime(
     const { clearTranscribeWidget, showTranscribeStatus } = await loadVisualizer();
     const active = recording!;
     recording = undefined;
-    active.meter.stop();
-    showTranscribeStatus(ctx, "finishing capture");
+    // Swap the meter for the transcribe status in place: clearing the slot
+    // first would collapse and re-expand the widget area, and capture.stop()
+    // is fast enough that an intermediate "finishing capture" state is noise.
+    active.meter.stop({ clearWidget: false });
+    showTranscribeStatus(ctx, "Transcribing…", { cancelable: true });
 
     try {
       let pcm: Float32Array;
@@ -230,7 +233,6 @@ export function createPiTranscribeRuntime(
       transcriptionAbort = controller;
 
       try {
-        showTranscribeStatus(ctx, "Transcribing...", { cancelable: true, spinner: true });
         const text = await active.reservation.submit(pcm, controller.signal);
         const seconds = pcm.length / CAPTURE_SAMPLE_RATE;
 
@@ -284,11 +286,12 @@ export function createPiTranscribeRuntime(
     );
     const meter = new RecordingMeter();
     capture.onFrame = (frame) => meter.push(frame);
-    meter.start(ctx);
+    // Paint the startup status before PvRecorder construction blocks the event
+    // loop; the meter takes over only once the device is open and frames flow.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     try {
       capture.start();
     } catch (error) {
-      meter.stop();
       clearCancelListener();
       ctx.ui.notify(captureErrorMessage(error), "error");
       if (!isMicrophoneUnavailableError(error)) {
@@ -297,6 +300,7 @@ export function createPiTranscribeRuntime(
       }
       return;
     }
+    meter.start(ctx);
 
     let reservation: DictationReservation;
     try {
@@ -329,8 +333,18 @@ export function createPiTranscribeRuntime(
       return;
     }
 
+    // First-press module loading and microphone initialization take a
+    // noticeable moment; show feedback until the recording meter takes over.
+    // Static text on the shared widget slot: an animated spinner repaints every
+    // frame, and the meter replaces plain lines without a component swap.
+    const { clearTranscribeWidget, showTranscribeStatus } = await loadVisualizer();
+    showTranscribeStatus(ctx, "Starting microphone…");
+
     const configured = await ensureSettings(ctx);
     if (configured) await startRecording(ctx, configured);
+    // The meter shares the widget slot and has replaced the spinner when
+    // recording began; clear the spinner only when recording never started.
+    if (!recording) clearTranscribeWidget(ctx);
   }
 
   function runExclusive(
