@@ -84,9 +84,9 @@ export async function runModelSelection(
             path = stillCached.path;
           } else {
             path = await downloadCatalogModel(model, { signal, onProgress });
-            // Esc during the download tail cancels the selection even though
-            // the bytes are already cached.
-            signal.throwIfAborted();
+            // A completed download always commits: the bytes are verified and
+            // cached, so a cancel racing the final write must not discard the
+            // selection.
           }
 
           await enqueueCommit(async () => {
