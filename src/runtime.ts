@@ -7,6 +7,7 @@ import { matchesKey } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 import type { MicrophoneCapture } from "./audio.js";
+import { PcmChunker } from "./pcm-chunker.js";
 import type { TranscribeSettings } from "./settings.js";
 import { displayShortcut } from "./shortcut-core.js";
 import {
@@ -18,6 +19,7 @@ import type { RecordingMeter } from "./visualizer.js";
 type ActiveRecording = {
   capture: MicrophoneCapture;
   reservation: DictationReservation;
+  chunker: PcmChunker;
   meter: RecordingMeter;
 };
 
@@ -198,6 +200,7 @@ export function createPiTranscribeRuntime(
     } catch {
       // Discarded either way.
     } finally {
+      active.chunker.discard();
       active.reservation.cancel();
       clearCancelListener();
       ctx.ui.notify("Recording discarded", "info");
@@ -218,6 +221,7 @@ export function createPiTranscribeRuntime(
       let pcm: Float32Array;
       try {
         const audio = await active.capture.stop();
+        active.chunker.flush();
         pcm = audio.pcm;
       } catch (error) {
         active.reservation.cancel();
@@ -285,13 +289,25 @@ export function createPiTranscribeRuntime(
         : undefined,
     );
     const meter = new RecordingMeter();
-    capture.onFrame = (frame) => meter.push(frame);
+    let reservation: DictationReservation;
+    try {
+      reservation = transcriptionService.reserveDictation(configured);
+    } catch (error) {
+      ctx.ui.notify(transcriptionErrorMessage(error), "error");
+      return;
+    }
+    const chunker = new PcmChunker((chunk) => reservation.feed(chunk));
+    capture.onFrame = (frame) => {
+      meter.push(frame);
+      chunker.push(frame);
+    };
     // Paint the startup status before PvRecorder construction blocks the event
     // loop; the meter takes over only once the device is open and frames flow.
     await new Promise<void>((resolve) => setImmediate(resolve));
     try {
       capture.start();
     } catch (error) {
+      reservation.cancel();
       clearCancelListener();
       ctx.ui.notify(captureErrorMessage(error), "error");
       if (!isMicrophoneUnavailableError(error)) {
@@ -302,16 +318,7 @@ export function createPiTranscribeRuntime(
     }
     meter.start(ctx);
 
-    let reservation: DictationReservation;
-    try {
-      reservation = transcriptionService.reserveDictation(configured);
-    } catch (error) {
-      meter.stop();
-      await capture.stop().catch(() => undefined);
-      ctx.ui.notify(transcriptionErrorMessage(error), "error");
-      return;
-    }
-    const active: ActiveRecording = { capture, reservation, meter };
+    const active: ActiveRecording = { capture, reservation, chunker, meter };
     recording = active;
 
     void reservation.ready.then(
@@ -421,6 +428,7 @@ export function createPiTranscribeRuntime(
     recording = undefined;
     clearCancelListener();
     if (active) {
+      active.chunker.discard();
       active.reservation.cancel();
       active.meter.stop();
       await active.capture.stop().catch(() => undefined);

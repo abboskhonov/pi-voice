@@ -1,4 +1,9 @@
-import type { TranscribeModel } from "transcribe-cpp";
+import type {
+  Capabilities,
+  Session,
+  Stream,
+  TranscribeModel,
+} from "transcribe-cpp";
 import { convertChineseOutput, isChineseLanguage } from "./chinese.js";
 import type { ChineseOutput } from "./settings.js";
 
@@ -7,6 +12,80 @@ export type TranscriptionOptions = {
   language?: string;
   chineseOutput?: ChineseOutput;
 };
+
+export type DictationStream = {
+  feed(chunk: Float32Array): Promise<void>;
+  finalize(): Promise<string>;
+  reset(): void;
+};
+
+type StreamingCapabilities = Pick<Capabilities, "supportsStreaming">;
+
+/** Streaming remains available in auto-language mode, including for Chinese-capable models. */
+export function canStreamDictation(
+  capabilities: StreamingCapabilities,
+): boolean {
+  return capabilities.supportsStreaming;
+}
+
+function validateLanguage(
+  capabilities: Pick<Capabilities, "languages">,
+  language: string | undefined,
+): void {
+  if (language && !capabilities.languages.includes(language)) {
+    throw new Error(
+      `Configured language ${language} is not supported by this model. Open /transcribe and choose another language.`,
+    );
+  }
+}
+
+class TranscribeCppDictationStream implements DictationStream {
+  private closed = false;
+
+  constructor(
+    private readonly session: Session,
+    private readonly stream: Stream,
+    private readonly language: string | undefined,
+    private readonly chineseOutput: ChineseOutput,
+  ) {}
+
+  async feed(chunk: Float32Array): Promise<void> {
+    if (this.closed) throw new Error("Dictation stream is closed");
+    await this.stream.feed(chunk);
+  }
+
+  async finalize(): Promise<string> {
+    if (this.closed) throw new Error("Dictation stream is closed");
+
+    let text: string;
+    try {
+      await this.stream.finalize();
+      if (this.closed) {
+        throw new Error("Dictation stream was reset while finalizing");
+      }
+      text = this.stream.text.full.trim();
+    } finally {
+      this.close();
+    }
+
+    return this.language && isChineseLanguage(this.language)
+      ? await convertChineseOutput(text, this.chineseOutput)
+      : text;
+  }
+
+  reset(): void {
+    this.close();
+  }
+
+  private close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    // reset() is synchronous at the binding boundary and queues native teardown
+    // behind any in-flight feed/finalize before the session is freed.
+    this.stream.reset();
+    this.session.dispose();
+  }
+}
 
 /** A reusable loaded transcribe.cpp model. Calls must be scheduled sequentially. */
 export class TranscribeCppBackend {
@@ -40,6 +119,33 @@ export class TranscribeCppBackend {
     }
   }
 
+  async startStream(
+    options: TranscriptionOptions = {},
+  ): Promise<DictationStream | undefined> {
+    await this.prepare();
+    const model = this.model!;
+    const capabilities = model.capabilities;
+    validateLanguage(capabilities, options.language);
+    if (!canStreamDictation(capabilities)) return undefined;
+
+    const session = model.createSession();
+    try {
+      const stream = await session.stream({
+        timestamps: "none",
+        ...(options.language ? { language: options.language } : {}),
+      });
+      return new TranscribeCppDictationStream(
+        session,
+        stream,
+        options.language,
+        options.chineseOutput ?? "simplified",
+      );
+    } catch (error) {
+      session.dispose();
+      throw error;
+    }
+  }
+
   async transcribe(
     pcm: Float32Array,
     options: TranscriptionOptions = {},
@@ -47,11 +153,7 @@ export class TranscribeCppBackend {
     if (pcm.length === 0) throw new Error("No audio samples were provided");
     await this.prepare();
     const model = this.model!;
-    if (options.language && !model.capabilities.languages.includes(options.language)) {
-      throw new Error(
-        `Configured language ${options.language} is not supported by this model. Open /transcribe and choose another language.`,
-      );
-    }
+    validateLanguage(model.capabilities, options.language);
 
     const result = await model.transcribe(pcm, {
       signal: options.signal,

@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { TranscribeSettings } from "../src/settings.js";
 import { TranscriptionService } from "../src/transcription-service.js";
-import type { TranscriptionOptions } from "../src/transcription.js";
+import type {
+  DictationStream,
+  TranscriptionOptions,
+} from "../src/transcription.js";
 import { deferred, nextTurn } from "./helpers.js";
 
 function settings(modelPath: string): TranscribeSettings {
@@ -114,6 +117,109 @@ test("cancelling a dictation reservation releases file work", async () => {
   await harness.service.shutdown();
 });
 
+test("a new reservation can be made after cancelling during model preparation", async () => {
+  const prepareGate = deferred();
+  const service = new TranscriptionService(() => ({
+    async prepare() {
+      await prepareGate.promise;
+    },
+    async transcribe(samples: Float32Array) {
+      return String(samples[0] ?? -1);
+    },
+    async dispose() {},
+  }));
+
+  const first = service.reserveDictation(settings("model-a"));
+  first.cancel();
+  let second!: ReturnType<TranscriptionService["reserveDictation"]>;
+  assert.doesNotThrow(() => {
+    second = service.reserveDictation(settings("model-a"));
+  });
+
+  prepareGate.resolve();
+  second.cancel();
+  await service.shutdown();
+});
+
+test("aborting a submission during model preparation releases its slot", async () => {
+  const prepareGate = deferred();
+  const service = new TranscriptionService(() => ({
+    async prepare() {
+      await prepareGate.promise;
+    },
+    async transcribe(samples: Float32Array) {
+      return String(samples[0] ?? -1);
+    },
+    async dispose() {},
+  }));
+
+  const controller = new AbortController();
+  const first = service.reserveDictation(settings("model-a"));
+  const result = first.submit(pcm(1), controller.signal);
+  controller.abort(new Error("cancelled while loading"));
+  let second!: ReturnType<TranscriptionService["reserveDictation"]>;
+  assert.doesNotThrow(() => {
+    second = service.reserveDictation(settings("model-a"));
+  });
+
+  prepareGate.resolve();
+  await assert.rejects(result, /cancelled while loading/);
+  second.cancel();
+  await service.shutdown();
+});
+
+test("aborting an unstarted queued submission rejects immediately", async () => {
+  const harness = createHarness([1]);
+  const activeFile = harness.service.transcribeFile(settings("model-a"), pcm(1));
+  await nextTurn();
+
+  const controller = new AbortController();
+  const reservation = harness.service.reserveDictation(settings("model-a"));
+  const result = reservation.submit(pcm(9), controller.signal);
+  controller.abort(new Error("cancelled while queued"));
+
+  let timeout: NodeJS.Timeout | undefined;
+  const settled = await Promise.race([
+    result.then(
+      () => "resolved",
+      () => "rejected",
+    ),
+    new Promise<"timeout">((resolve) => {
+      timeout = setTimeout(() => resolve("timeout"), 100);
+    }),
+  ]);
+  if (timeout) clearTimeout(timeout);
+  assert.equal(settled, "rejected");
+  await assert.rejects(result, /cancelled while queued/);
+
+  harness.release(1);
+  assert.equal(await activeFile, "1");
+  assert.equal(harness.events.includes("run:9"), false);
+  await harness.service.shutdown();
+});
+
+test("a submitted reservation is queued when a replacement is admitted", async () => {
+  const harness = createHarness([1]);
+  const activeFile = harness.service.transcribeFile(settings("model-a"), pcm(1));
+  await nextTurn();
+
+  const first = harness.service.reserveDictation(settings("model-a"));
+  const firstResult = first.submit(pcm(9));
+  let second!: ReturnType<TranscriptionService["reserveDictation"]>;
+  assert.doesNotThrow(() => {
+    second = harness.service.reserveDictation(settings("model-a"));
+  });
+  second.cancel();
+
+  harness.release(1);
+  assert.deepEqual(await Promise.all([activeFile, firstResult]), ["1", "9"]);
+  assert.deepEqual(
+    harness.events.filter((event) => event.startsWith("run:")),
+    ["run:1", "run:9"],
+  );
+  await harness.service.shutdown();
+});
+
 test("a different model is unloaded and loaded at the queue boundary", async () => {
   const harness = createHarness([4]);
   const first = harness.service.transcribeFile(settings("model-a"), pcm(4));
@@ -130,4 +236,196 @@ test("a different model is unloaded and loaded at the queue boundary", async () 
   assert.equal(harness.events.filter((event) => event === "load:model-a").length, 1);
   assert.equal(harness.events.filter((event) => event === "load:model-b").length, 1);
   await harness.service.shutdown();
+});
+
+test("a stream releases the model before the next batch run", async () => {
+  const events: string[] = [];
+  let streamActive = false;
+  const service = new TranscriptionService(() => ({
+    async prepare() {},
+    async startStream(): Promise<DictationStream> {
+      assert.equal(streamActive, false);
+      streamActive = true;
+      events.push("stream:start");
+      return {
+        async feed(samples) {
+          events.push(`feed:${samples[0] ?? -1}`);
+        },
+        async finalize() {
+          events.push("stream:finalize");
+          streamActive = false;
+          return "streamed";
+        },
+        reset() {
+          if (streamActive) events.push("stream:reset");
+          streamActive = false;
+        },
+      };
+    },
+    async transcribe(samples) {
+      assert.equal(streamActive, false, "batch transcription started with an active stream");
+      events.push(`batch:${samples[0] ?? -1}`);
+      return String(samples[0] ?? -1);
+    },
+    async dispose() {},
+  }));
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  await reservation.ready;
+  reservation.feed(pcm(7));
+  const file = service.transcribeFile(settings("model-a"), pcm(3));
+  const dictation = reservation.submit(pcm(9));
+
+  assert.equal(await dictation, "streamed");
+  assert.equal(await file, "3");
+  assert.ok(events.indexOf("stream:finalize") < events.indexOf("batch:3"));
+  await service.shutdown();
+});
+
+test("a feed failure resets the stream before batch fallback", async () => {
+  const events: string[] = [];
+  let streamActive = false;
+  const service = new TranscriptionService(() => ({
+    async prepare() {},
+    async startStream(): Promise<DictationStream> {
+      streamActive = true;
+      return {
+        async feed() {
+          events.push("feed:failed");
+          throw new Error("stream feed failed");
+        },
+        async finalize() {
+          throw new Error("failed stream must not be finalized");
+        },
+        reset() {
+          events.push("stream:reset");
+          streamActive = false;
+        },
+      };
+    },
+    async transcribe(samples) {
+      assert.equal(streamActive, false, "fallback started before stream reset");
+      events.push("batch:fallback");
+      return `fallback:${samples[0] ?? -1}`;
+    },
+    async dispose() {},
+  }));
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  await reservation.ready;
+  reservation.feed(pcm(7));
+  await nextTurn();
+  const result = await reservation.submit(pcm(9));
+
+  assert.equal(result, "fallback:9");
+  assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:fallback"));
+  await service.shutdown();
+});
+
+test("a finalize failure resets the stream before batch fallback", async () => {
+  const events: string[] = [];
+  let streamActive = false;
+  const service = new TranscriptionService(() => ({
+    async prepare() {},
+    async startStream(): Promise<DictationStream> {
+      streamActive = true;
+      return {
+        async feed() {},
+        async finalize() {
+          events.push("stream:finalize-failed");
+          throw new Error("stream finalize failed");
+        },
+        reset() {
+          events.push("stream:reset");
+          streamActive = false;
+        },
+      };
+    },
+    async transcribe(samples) {
+      assert.equal(streamActive, false, "fallback started before stream reset");
+      events.push("batch:fallback");
+      return `fallback:${samples[0] ?? -1}`;
+    },
+    async dispose() {},
+  }));
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  await reservation.ready;
+  const result = await reservation.submit(pcm(9));
+
+  assert.equal(result, "fallback:9");
+  assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:fallback"));
+  await service.shutdown();
+});
+
+test("dictation submitted before model preparation uses the batch path", async () => {
+  const prepareGate = deferred();
+  let streamStarts = 0;
+  const service = new TranscriptionService(() => ({
+    async prepare() {
+      await prepareGate.promise;
+    },
+    async startStream(): Promise<DictationStream> {
+      streamStarts += 1;
+      throw new Error("a late stream must not be opened");
+    },
+    async transcribe(samples) {
+      return String(samples[0] ?? -1);
+    },
+    async dispose() {},
+  }));
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  const result = reservation.submit(pcm(9));
+  prepareGate.resolve();
+
+  assert.equal(await result, "9");
+  assert.equal(streamStarts, 0);
+  await service.shutdown();
+});
+
+test("cancelling with an in-flight feed discards queued chunks and releases file work", async () => {
+  const feedGate = deferred();
+  const events: string[] = [];
+  let streamActive = false;
+  const service = new TranscriptionService(() => ({
+    async prepare() {},
+    async startStream(): Promise<DictationStream> {
+      streamActive = true;
+      return {
+        async feed(samples) {
+          events.push(`feed:${samples[0] ?? -1}`);
+          await feedGate.promise;
+        },
+        async finalize() {
+          throw new Error("cancelled stream must not be finalized");
+        },
+        reset() {
+          events.push("stream:reset");
+          streamActive = false;
+        },
+      };
+    },
+    async transcribe(samples) {
+      assert.equal(streamActive, false, "file work started before stream reset");
+      events.push(`batch:${samples[0] ?? -1}`);
+      return String(samples[0] ?? -1);
+    },
+    async dispose() {},
+  }));
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  await reservation.ready;
+  reservation.feed(pcm(1));
+  reservation.feed(pcm(2));
+  await nextTurn();
+  const file = service.transcribeFile(settings("model-a"), pcm(3));
+  reservation.cancel();
+
+  assert.equal(await file, "3");
+  feedGate.resolve();
+  await nextTurn();
+  assert.deepEqual(events.filter((event) => event.startsWith("feed:")), ["feed:1"]);
+  assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:3"));
+  await service.shutdown();
 });

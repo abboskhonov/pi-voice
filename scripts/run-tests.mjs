@@ -28,7 +28,9 @@ try {
   await run(process.execPath, [
     "--test",
     join(outputDirectory, "test", "async-limiter.test.js"),
+    join(outputDirectory, "test", "pcm-chunker.test.js"),
     join(outputDirectory, "test", "transcription-service.test.js"),
+    join(outputDirectory, "test", "transcription.test.js"),
   ]);
 } finally {
   await rm(outputDirectory, { recursive: true, force: true });
