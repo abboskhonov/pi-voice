@@ -58,17 +58,21 @@ class TranscribeCppDictationStream implements DictationStream {
     if (this.closed) throw new Error("Dictation stream is closed");
 
     let text: string;
+    let detectedLanguage: string;
     try {
       await this.stream.finalize();
       if (this.closed) {
         throw new Error("Dictation stream was reset while finalizing");
       }
-      text = this.stream.text.full.trim();
+      const snapshot = this.stream.snapshot;
+      text = snapshot.text.trim();
+      detectedLanguage = snapshot.language;
     } finally {
       this.close();
     }
 
-    return this.language && isChineseLanguage(this.language)
+    const language = detectedLanguage || this.language || "";
+    return isChineseLanguage(language)
       ? await convertChineseOutput(text, this.chineseOutput)
       : text;
   }
