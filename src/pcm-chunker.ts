@@ -1,4 +1,5 @@
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
+import { convertFrames } from "./pcm.js";
 
 export const STREAM_CHUNK_SAMPLES = CAPTURE_SAMPLE_RATE / 2;
 
@@ -33,14 +34,7 @@ export class PcmChunker {
   }
 
   private emit(): void {
-    const pcm = new Float32Array(this.sampleCount);
-    let offset = 0;
-    for (const frame of this.frames) {
-      for (let index = 0; index < frame.length; index += 1) {
-        pcm[offset + index] = (frame[index] ?? 0) / 32_768;
-      }
-      offset += frame.length;
-    }
+    const pcm = convertFrames(this.frames);
     this.frames = [];
     this.sampleCount = 0;
     this.onChunk(pcm);

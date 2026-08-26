@@ -298,8 +298,11 @@ export function createPiTranscribeRuntime(
     }
     const chunker = new PcmChunker((chunk) => reservation.feed(chunk));
     capture.onFrame = (frame) => {
-      meter.push(frame);
+      // The chunker feeds the transcript, so it runs first: the capture loop
+      // swallows onFrame errors, and a visualizer failure must not drop audio
+      // from the streamed text while the frame still lands in the full clip.
       chunker.push(frame);
+      meter.push(frame);
     };
     // Paint the startup status before PvRecorder construction blocks the event
     // loop; the meter takes over only once the device is open and frames flow.
@@ -316,22 +319,37 @@ export function createPiTranscribeRuntime(
       }
       return;
     }
-    meter.start(ctx);
-
     const active: ActiveRecording = { capture, reservation, chunker, meter };
-    recording = active;
+    try {
+      meter.start(ctx);
+      recording = active;
 
-    void reservation.ready.then(
-      () => {
-        if (recording === active) active.meter.setModelState("ready");
-      },
-      () => {
-        if (recording === active) active.meter.setModelState("failed");
-      },
-    );
+      void reservation.ready.then(
+        () => {
+          if (recording === active) active.meter.setModelState("ready");
+        },
+        () => {
+          if (recording === active) active.meter.setModelState("failed");
+        },
+      );
 
-    listenForCancel(ctx);
-    ctx.ui.notify("Microphone recording started", "info");
+      listenForCancel(ctx);
+      ctx.ui.notify("Microphone recording started", "info");
+    } catch (error) {
+      // The reservation parks the transcription loop until it is submitted or
+      // cancelled, so leaking it here would block every later dictation and
+      // file job until restart.
+      if (recording === active) recording = undefined;
+      meter.stop();
+      chunker.discard();
+      reservation.cancel();
+      clearCancelListener();
+      await capture.stop().catch(() => undefined);
+      ctx.ui.notify(
+        `Recording failed to start: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
   }
 
   async function toggleCaptureTask(ctx: ExtensionContext): Promise<void> {

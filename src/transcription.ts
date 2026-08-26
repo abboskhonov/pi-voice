@@ -39,6 +39,23 @@ function validateLanguage(
   }
 }
 
+/**
+ * Shared final step for batch and streaming output: trim, then apply the
+ * Chinese script preference when the detected (or configured) language is
+ * Chinese. Keeping this in one place keeps the two paths from drifting.
+ */
+async function finishTranscript(
+  text: string,
+  detectedLanguage: string,
+  configuredLanguage: string | undefined,
+  chineseOutput: ChineseOutput,
+): Promise<string> {
+  const trimmed = text.trim();
+  return isChineseLanguage(detectedLanguage || configuredLanguage || "")
+    ? convertChineseOutput(trimmed, chineseOutput)
+    : trimmed;
+}
+
 class TranscribeCppDictationStream implements DictationStream {
   private closed = false;
 
@@ -65,16 +82,13 @@ class TranscribeCppDictationStream implements DictationStream {
         throw new Error("Dictation stream was reset while finalizing");
       }
       const snapshot = this.stream.snapshot;
-      text = snapshot.text.trim();
+      text = snapshot.text;
       detectedLanguage = snapshot.language;
     } finally {
       this.close();
     }
 
-    const language = detectedLanguage || this.language || "";
-    return isChineseLanguage(language)
-      ? await convertChineseOutput(text, this.chineseOutput)
-      : text;
+    return finishTranscript(text, detectedLanguage, this.language, this.chineseOutput);
   }
 
   reset(): void {
@@ -164,10 +178,12 @@ export class TranscribeCppBackend {
       timestamps: "none",
       ...(options.language ? { language: options.language } : {}),
     });
-    const text = result.text.trim();
-    return isChineseLanguage(result.language || options.language || "")
-      ? await convertChineseOutput(text, options.chineseOutput ?? "simplified")
-      : text;
+    return finishTranscript(
+      result.text,
+      result.language,
+      options.language,
+      options.chineseOutput ?? "simplified",
+    );
   }
 
   async dispose(): Promise<void> {

@@ -429,3 +429,73 @@ test("cancelling with an in-flight feed discards queued chunks and releases file
   assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:3"));
   await service.shutdown();
 });
+
+test("a submission that lands while the stream opens uses the batch path", async () => {
+  const streamGate = deferred();
+  const events: string[] = [];
+  const service = new TranscriptionService(() => ({
+    async prepare() {},
+    async startStream(): Promise<DictationStream> {
+      events.push("stream:start");
+      await streamGate.promise;
+      return {
+        async feed() {
+          throw new Error("a late stream must not be fed");
+        },
+        async finalize() {
+          throw new Error("a late stream must not be finalized");
+        },
+        reset() {
+          events.push("stream:reset");
+        },
+      };
+    },
+    async transcribe(samples) {
+      events.push(`batch:${samples[0] ?? -1}`);
+      return String(samples[0] ?? -1);
+    },
+    async dispose() {},
+  }));
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  await nextTurn();
+  assert.deepEqual(events, ["stream:start"]);
+  reservation.feed(pcm(7));
+  const result = reservation.submit(pcm(9));
+  streamGate.resolve();
+
+  assert.equal(await result, "9");
+  assert.deepEqual(events, ["stream:start", "stream:reset", "batch:9"]);
+  await service.shutdown();
+});
+
+test("an empty recording never reaches stream finalize", async () => {
+  const events: string[] = [];
+  const service = new TranscriptionService(() => ({
+    async prepare() {},
+    async startStream(): Promise<DictationStream> {
+      events.push("stream:start");
+      return {
+        async feed() {},
+        async finalize() {
+          throw new Error("an unfed stream must not be finalized");
+        },
+        reset() {
+          events.push("stream:reset");
+        },
+      };
+    },
+    async transcribe(samples) {
+      events.push(`batch:${samples.length}`);
+      if (samples.length === 0) throw new Error("No audio samples were provided");
+      return "text";
+    },
+    async dispose() {},
+  }));
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  await reservation.ready;
+  await assert.rejects(reservation.submit(new Float32Array(0)), /No audio samples/);
+  assert.deepEqual(events, ["stream:start", "stream:reset", "batch:0"]);
+  await service.shutdown();
+});
