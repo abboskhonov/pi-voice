@@ -33,24 +33,11 @@ export function isChineseLanguage(language: string): boolean {
   return base === "zh" || base === "yue";
 }
 
-/**
- * Post-processing step: never fails the transcription. If the converter cannot
- * load or convert, the raw model output is returned unchanged.
- */
 export async function convertChineseOutput(
   text: string,
   output: ChineseOutput,
 ): Promise<string> {
-  try {
-    return await (await converterFor(output))(text);
-  } catch (error) {
-    console.warn(
-      `pi-transcribe: Chinese output conversion failed; returning unconverted text: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    return text;
-  }
+  return (await converterFor(output))(text);
 }
 
 export function chineseOutputSummary(output: ChineseOutput): string {
