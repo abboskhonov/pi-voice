@@ -297,6 +297,9 @@ export class TranscriptionService {
   }
 
   private async process(): Promise<void> {
+    // Model work is non-preemptive. At each operation boundary, submitted
+    // dictation and active recording reservations run before queued file jobs.
+    // An active recording holds the model lane until submit or cancel.
     while (!this.shuttingDown) {
       const queuedDictation = this.dictationQueue.shift();
       if (queuedDictation) {

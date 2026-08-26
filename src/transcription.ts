@@ -19,15 +19,6 @@ export type DictationStream = {
   reset(): void;
 };
 
-type StreamingCapabilities = Pick<Capabilities, "supportsStreaming">;
-
-/** Streaming remains available in auto-language mode, including for Chinese-capable models. */
-export function canStreamDictation(
-  capabilities: StreamingCapabilities,
-): boolean {
-  return capabilities.supportsStreaming;
-}
-
 function validateLanguage(
   capabilities: Pick<Capabilities, "languages">,
   language: string | undefined,
@@ -144,7 +135,7 @@ export class TranscribeCppBackend {
     const model = this.model!;
     const capabilities = model.capabilities;
     validateLanguage(capabilities, options.language);
-    if (!canStreamDictation(capabilities)) return undefined;
+    if (!capabilities.supportsStreaming) return undefined;
 
     const session = model.createSession();
     try {

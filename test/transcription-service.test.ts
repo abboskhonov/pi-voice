@@ -25,6 +25,44 @@ function pcm(id: number): Float32Array {
   return Float32Array.of(id);
 }
 
+type TestBackend = {
+  prepare(): Promise<void>;
+  startStream?(
+    options?: TranscriptionOptions,
+  ): Promise<DictationStream | undefined>;
+  transcribe(
+    samples: Float32Array,
+    options?: TranscriptionOptions,
+  ): Promise<string>;
+  dispose(): Promise<void>;
+};
+
+function createTestService(
+  overrides: Partial<TestBackend> = {},
+): TranscriptionService {
+  return new TranscriptionService(() => ({
+    async prepare() {},
+    async transcribe(samples) {
+      return String(samples[0] ?? -1);
+    },
+    async dispose() {},
+    ...overrides,
+  }));
+}
+
+function createTestStream(
+  overrides: Partial<DictationStream> = {},
+): DictationStream {
+  return {
+    async feed() {},
+    async finalize() {
+      return "streamed";
+    },
+    reset() {},
+    ...overrides,
+  };
+}
+
 function createHarness(blockedIds: readonly number[] = []): {
   service: TranscriptionService;
   events: string[];
@@ -119,15 +157,11 @@ test("cancelling a dictation reservation releases file work", async () => {
 
 test("a new reservation can be made after cancelling during model preparation", async () => {
   const prepareGate = deferred();
-  const service = new TranscriptionService(() => ({
+  const service = createTestService({
     async prepare() {
       await prepareGate.promise;
     },
-    async transcribe(samples: Float32Array) {
-      return String(samples[0] ?? -1);
-    },
-    async dispose() {},
-  }));
+  });
 
   const first = service.reserveDictation(settings("model-a"));
   first.cancel();
@@ -143,15 +177,11 @@ test("a new reservation can be made after cancelling during model preparation", 
 
 test("aborting a submission during model preparation releases its slot", async () => {
   const prepareGate = deferred();
-  const service = new TranscriptionService(() => ({
+  const service = createTestService({
     async prepare() {
       await prepareGate.promise;
     },
-    async transcribe(samples: Float32Array) {
-      return String(samples[0] ?? -1);
-    },
-    async dispose() {},
-  }));
+  });
 
   const controller = new AbortController();
   const first = service.reserveDictation(settings("model-a"));
@@ -241,13 +271,12 @@ test("a different model is unloaded and loaded at the queue boundary", async () 
 test("a stream releases the model before the next batch run", async () => {
   const events: string[] = [];
   let streamActive = false;
-  const service = new TranscriptionService(() => ({
-    async prepare() {},
-    async startStream(): Promise<DictationStream> {
+  const service = createTestService({
+    async startStream() {
       assert.equal(streamActive, false);
       streamActive = true;
       events.push("stream:start");
-      return {
+      return createTestStream({
         async feed(samples) {
           events.push(`feed:${samples[0] ?? -1}`);
         },
@@ -260,15 +289,14 @@ test("a stream releases the model before the next batch run", async () => {
           if (streamActive) events.push("stream:reset");
           streamActive = false;
         },
-      };
+      });
     },
     async transcribe(samples) {
       assert.equal(streamActive, false, "batch transcription started with an active stream");
       events.push(`batch:${samples[0] ?? -1}`);
       return String(samples[0] ?? -1);
     },
-    async dispose() {},
-  }));
+  });
 
   const reservation = service.reserveDictation(settings("model-a"));
   await reservation.ready;
@@ -282,98 +310,65 @@ test("a stream releases the model before the next batch run", async () => {
   await service.shutdown();
 });
 
-test("a feed failure resets the stream before batch fallback", async () => {
-  const events: string[] = [];
-  let streamActive = false;
-  const service = new TranscriptionService(() => ({
-    async prepare() {},
-    async startStream(): Promise<DictationStream> {
-      streamActive = true;
-      return {
-        async feed() {
-          events.push("feed:failed");
-          throw new Error("stream feed failed");
-        },
-        async finalize() {
-          throw new Error("failed stream must not be finalized");
-        },
-        reset() {
-          events.push("stream:reset");
-          streamActive = false;
-        },
-      };
-    },
-    async transcribe(samples) {
-      assert.equal(streamActive, false, "fallback started before stream reset");
-      events.push("batch:fallback");
-      return `fallback:${samples[0] ?? -1}`;
-    },
-    async dispose() {},
-  }));
+for (const failurePoint of ["feed", "finalize"] as const) {
+  test(`a ${failurePoint} failure resets the stream before batch fallback`, async () => {
+    const events: string[] = [];
+    let streamActive = false;
+    const service = createTestService({
+      async startStream() {
+        streamActive = true;
+        return createTestStream({
+          async feed() {
+            if (failurePoint !== "feed") return;
+            events.push("stream:feed-failed");
+            throw new Error("stream feed failed");
+          },
+          async finalize() {
+            if (failurePoint === "feed") {
+              throw new Error("failed stream must not be finalized");
+            }
+            events.push("stream:finalize-failed");
+            throw new Error("stream finalize failed");
+          },
+          reset() {
+            events.push("stream:reset");
+            streamActive = false;
+          },
+        });
+      },
+      async transcribe(samples) {
+        assert.equal(streamActive, false, "fallback started before stream reset");
+        events.push("batch:fallback");
+        return `fallback:${samples[0] ?? -1}`;
+      },
+    });
 
-  const reservation = service.reserveDictation(settings("model-a"));
-  await reservation.ready;
-  reservation.feed(pcm(7));
-  await nextTurn();
-  const result = await reservation.submit(pcm(9));
+    const reservation = service.reserveDictation(settings("model-a"));
+    await reservation.ready;
+    if (failurePoint === "feed") {
+      reservation.feed(pcm(7));
+      await nextTurn();
+    }
+    const result = await reservation.submit(pcm(9));
 
-  assert.equal(result, "fallback:9");
-  assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:fallback"));
-  await service.shutdown();
-});
-
-test("a finalize failure resets the stream before batch fallback", async () => {
-  const events: string[] = [];
-  let streamActive = false;
-  const service = new TranscriptionService(() => ({
-    async prepare() {},
-    async startStream(): Promise<DictationStream> {
-      streamActive = true;
-      return {
-        async feed() {},
-        async finalize() {
-          events.push("stream:finalize-failed");
-          throw new Error("stream finalize failed");
-        },
-        reset() {
-          events.push("stream:reset");
-          streamActive = false;
-        },
-      };
-    },
-    async transcribe(samples) {
-      assert.equal(streamActive, false, "fallback started before stream reset");
-      events.push("batch:fallback");
-      return `fallback:${samples[0] ?? -1}`;
-    },
-    async dispose() {},
-  }));
-
-  const reservation = service.reserveDictation(settings("model-a"));
-  await reservation.ready;
-  const result = await reservation.submit(pcm(9));
-
-  assert.equal(result, "fallback:9");
-  assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:fallback"));
-  await service.shutdown();
-});
+    assert.equal(result, "fallback:9");
+    assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:fallback"));
+    await service.shutdown();
+  });
+}
 
 test("dictation submitted before model preparation uses the batch path", async () => {
   const prepareGate = deferred();
   let streamStarts = 0;
-  const service = new TranscriptionService(() => ({
+  const service = createTestService({
     async prepare() {
       await prepareGate.promise;
     },
-    async startStream(): Promise<DictationStream> {
+    async startStream() {
       streamStarts += 1;
       throw new Error("a late stream must not be opened");
     },
-    async transcribe(samples) {
-      return String(samples[0] ?? -1);
-    },
-    async dispose() {},
-  }));
+  });
 
   const reservation = service.reserveDictation(settings("model-a"));
   const result = reservation.submit(pcm(9));
@@ -388,11 +383,10 @@ test("cancelling with an in-flight feed discards queued chunks and releases file
   const feedGate = deferred();
   const events: string[] = [];
   let streamActive = false;
-  const service = new TranscriptionService(() => ({
-    async prepare() {},
-    async startStream(): Promise<DictationStream> {
+  const service = createTestService({
+    async startStream() {
       streamActive = true;
-      return {
+      return createTestStream({
         async feed(samples) {
           events.push(`feed:${samples[0] ?? -1}`);
           await feedGate.promise;
@@ -404,15 +398,14 @@ test("cancelling with an in-flight feed discards queued chunks and releases file
           events.push("stream:reset");
           streamActive = false;
         },
-      };
+      });
     },
     async transcribe(samples) {
       assert.equal(streamActive, false, "file work started before stream reset");
       events.push(`batch:${samples[0] ?? -1}`);
       return String(samples[0] ?? -1);
     },
-    async dispose() {},
-  }));
+  });
 
   const reservation = service.reserveDictation(settings("model-a"));
   await reservation.ready;
@@ -433,12 +426,11 @@ test("cancelling with an in-flight feed discards queued chunks and releases file
 test("a submission that lands while the stream opens uses the batch path", async () => {
   const streamGate = deferred();
   const events: string[] = [];
-  const service = new TranscriptionService(() => ({
-    async prepare() {},
-    async startStream(): Promise<DictationStream> {
+  const service = createTestService({
+    async startStream() {
       events.push("stream:start");
       await streamGate.promise;
-      return {
+      return createTestStream({
         async feed() {
           throw new Error("a late stream must not be fed");
         },
@@ -448,14 +440,13 @@ test("a submission that lands while the stream opens uses the batch path", async
         reset() {
           events.push("stream:reset");
         },
-      };
+      });
     },
     async transcribe(samples) {
       events.push(`batch:${samples[0] ?? -1}`);
       return String(samples[0] ?? -1);
     },
-    async dispose() {},
-  }));
+  });
 
   const reservation = service.reserveDictation(settings("model-a"));
   await nextTurn();
@@ -471,27 +462,24 @@ test("a submission that lands while the stream opens uses the batch path", async
 
 test("an empty recording never reaches stream finalize", async () => {
   const events: string[] = [];
-  const service = new TranscriptionService(() => ({
-    async prepare() {},
-    async startStream(): Promise<DictationStream> {
+  const service = createTestService({
+    async startStream() {
       events.push("stream:start");
-      return {
-        async feed() {},
+      return createTestStream({
         async finalize() {
           throw new Error("an unfed stream must not be finalized");
         },
         reset() {
           events.push("stream:reset");
         },
-      };
+      });
     },
     async transcribe(samples) {
       events.push(`batch:${samples.length}`);
       if (samples.length === 0) throw new Error("No audio samples were provided");
       return "text";
     },
-    async dispose() {},
-  }));
+  });
 
   const reservation = service.reserveDictation(settings("model-a"));
   await reservation.ready;
