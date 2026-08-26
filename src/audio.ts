@@ -2,6 +2,7 @@ import { PvRecorder } from "@picovoice/pvrecorder-node";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
+import { convertFrames } from "./pcm.js";
 
 export { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 
@@ -31,21 +32,6 @@ export function getAvailableMicrophones(): string[] {
 
 function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
-}
-
-function convertFrames(frames: Int16Array[]): Float32Array {
-  const sampleCount = frames.reduce((total, frame) => total + frame.length, 0);
-  const pcm = new Float32Array(sampleCount);
-  let offset = 0;
-
-  for (const frame of frames) {
-    for (let index = 0; index < frame.length; index += 1) {
-      pcm[offset + index] = (frame[index] ?? 0) / 32_768;
-    }
-    offset += frame.length;
-  }
-
-  return pcm;
 }
 
 type MicPermissionResult =

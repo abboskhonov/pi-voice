@@ -1,10 +1,12 @@
+import { Deferred } from "./deferred.js";
 import type { TranscribeSettings } from "./settings.js";
-import type { TranscribeCppBackend } from "./transcription.js";
-
-type JobPriority = "dictation" | "file";
+import type {
+  DictationStream,
+  TranscribeCppBackend,
+  TranscriptionOptions,
+} from "./transcription.js";
 
 type TranscriptionJob = {
-  priority: JobPriority;
   settings: TranscribeSettings;
   pcm: Float32Array;
   signal?: AbortSignal;
@@ -17,21 +19,41 @@ type TranscriptionJob = {
 
 type ReservationState = {
   settings: TranscribeSettings;
-  active: boolean;
+  accepting: boolean;
   submitted: boolean;
-  ready: Promise<void>;
-  resolveReady: () => void;
-  rejectReady: (error: unknown) => void;
-  readySettled: boolean;
+  cancelled: boolean;
+  started: boolean;
+  /** Settles once the model (and stream, when available) is ready, or on failure. */
+  ready: Deferred;
+  /** Resolves when recording ends, whether by submit or cancel. */
+  submission: Deferred;
+  result: Deferred<string>;
+  fullPcm?: Float32Array;
+  signal?: AbortSignal;
+  removeAbortListener?: () => void;
+  chunks: Float32Array[];
+  stream?: DictationStream;
+  drain?: Promise<void>;
+  streamUnavailable: boolean;
+  streamError?: unknown;
 };
 
 export type DictationReservation = {
   readonly ready: Promise<void>;
+  feed(chunk: Float32Array): void;
   submit(pcm: Float32Array, signal?: AbortSignal): Promise<string>;
   cancel(): void;
 };
 
-type ReusableBackend = Pick<TranscribeCppBackend, "prepare" | "transcribe" | "dispose">;
+type ReusableBackend = Pick<
+  TranscribeCppBackend,
+  "prepare" | "transcribe" | "dispose"
+> & {
+  startStream?: (
+    options?: TranscriptionOptions,
+  ) => Promise<DictationStream | undefined>;
+};
+
 type BackendFactory = (
   modelPath: string,
 ) => ReusableBackend | Promise<ReusableBackend>;
@@ -40,12 +62,31 @@ function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Transcription cancelled");
 }
 
+function cancellationError(state: ReservationState): Error {
+  return state.signal?.aborted ? abortError(state.signal) : new Error("Dictation cancelled");
+}
+
+function transcriptionOptions(
+  settings: TranscribeSettings,
+  signal?: AbortSignal,
+): TranscriptionOptions {
+  return {
+    signal,
+    language:
+      settings.transcriptionLanguage === "auto"
+        ? undefined
+        : settings.transcriptionLanguage,
+    chineseOutput: settings.chineseOutput,
+  };
+}
+
 /** Owns the loaded model and schedules dictation ahead of queued file jobs. */
 export class TranscriptionService {
   private backend: ReusableBackend | undefined;
   private modelPath: string | undefined;
-  private readonly dictationQueue: TranscriptionJob[] = [];
+  private readonly dictationQueue: ReservationState[] = [];
   private readonly fileQueue: TranscriptionJob[] = [];
+  private readonly reservationStates = new Set<ReservationState>();
   private reservation: ReservationState | undefined;
   private loop: Promise<void> | undefined;
   private shuttingDown = false;
@@ -60,54 +101,69 @@ export class TranscriptionService {
 
   reserveDictation(settings: TranscribeSettings): DictationReservation {
     if (this.shuttingDown) throw new Error("pi-transcribe is shutting down");
-    if (this.reservation?.active) throw new Error("A dictation reservation is already active");
+    if (this.reservation) throw new Error("A dictation reservation is already active");
 
-    let resolveReady!: () => void;
-    let rejectReady!: (error: unknown) => void;
     const state: ReservationState = {
       settings,
-      active: true,
+      accepting: true,
       submitted: false,
-      ready: new Promise<void>((resolve, reject) => {
-        resolveReady = resolve;
-        rejectReady = reject;
-      }),
-      resolveReady: () => {
-        if (state.readySettled) return;
-        state.readySettled = true;
-        resolveReady();
-      },
-      rejectReady: (error) => {
-        if (state.readySettled) return;
-        state.readySettled = true;
-        rejectReady(error);
-      },
-      readySettled: false,
+      cancelled: false,
+      started: false,
+      ready: new Deferred(),
+      submission: new Deferred(),
+      result: new Deferred<string>(),
+      chunks: [],
+      streamUnavailable: false,
     };
-    // The meter observes failures through ready, but cancellation may happen before
-    // a caller attaches its handlers.
-    void state.ready.catch(() => undefined);
+    // Cancellation can happen before callers attach handlers to either promise.
+    void state.ready.promise.catch(() => undefined);
+    void state.result.promise.catch(() => undefined);
     this.reservation = state;
+    this.reservationStates.add(state);
     this.schedule();
 
     return {
-      ready: state.ready,
+      ready: state.ready.promise,
+      feed: (chunk) => {
+        if (
+          !state.accepting ||
+          state.streamUnavailable ||
+          state.streamError !== undefined ||
+          chunk.length === 0
+        ) return;
+        state.chunks.push(chunk);
+        this.startDrain(state);
+      },
       submit: (pcm, signal) => {
-        if (!state.active || state.submitted) {
+        if (!state.accepting || state.submitted) {
           return Promise.reject(new Error("The dictation reservation is no longer active"));
         }
+        state.accepting = false;
         state.submitted = true;
-        state.active = false;
+        state.fullPcm = pcm;
         if (this.reservation === state) this.reservation = undefined;
-        const result = this.enqueue("dictation", state.settings, pcm, signal);
+        if (!state.started) this.dictationQueue.push(state);
+        state.signal = signal;
+        if (signal) {
+          const onAbort = (): void => this.abortReservation(state);
+          signal.addEventListener("abort", onAbort, { once: true });
+          state.removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+          if (signal.aborted) onAbort();
+        }
+        state.submission.resolve();
         this.schedule();
-        return result;
+        return state.result.promise;
       },
       cancel: () => {
-        if (!state.active || state.submitted) return;
-        state.active = false;
+        if (!state.accepting || state.submitted) return;
+        state.accepting = false;
+        state.cancelled = true;
+        state.chunks.length = 0;
         if (this.reservation === state) this.reservation = undefined;
-        state.rejectReady(new Error("Dictation cancelled"));
+        this.resetStream(state);
+        state.ready.reject(cancellationError(state));
+        state.submission.resolve();
+        if (!state.started) this.reservationStates.delete(state);
         this.schedule();
       },
     };
@@ -118,21 +174,11 @@ export class TranscriptionService {
     pcm: Float32Array,
     signal?: AbortSignal,
   ): Promise<string> {
-    return this.enqueue("file", settings, pcm, signal);
-  }
-
-  private enqueue(
-    priority: JobPriority,
-    settings: TranscribeSettings,
-    pcm: Float32Array,
-    signal?: AbortSignal,
-  ): Promise<string> {
     if (this.shuttingDown) return Promise.reject(new Error("pi-transcribe is shutting down"));
     if (signal?.aborted) return Promise.reject(abortError(signal));
 
     const result = new Promise<string>((resolve, reject) => {
       const job: TranscriptionJob = {
-        priority,
         settings,
         pcm,
         signal,
@@ -144,23 +190,85 @@ export class TranscriptionService {
       if (signal) {
         const onAbort = (): void => {
           if (job.started || job.settled) return;
-          this.removeQueuedJob(job);
+          const index = this.fileQueue.indexOf(job);
+          if (index >= 0) this.fileQueue.splice(index, 1);
           this.settleJob(job, () => reject(abortError(signal)));
           this.schedule();
         };
         signal.addEventListener("abort", onAbort, { once: true });
         job.removeAbortListener = () => signal.removeEventListener("abort", onAbort);
       }
-      (priority === "dictation" ? this.dictationQueue : this.fileQueue).push(job);
+      this.fileQueue.push(job);
     });
     this.schedule();
     return result;
   }
 
-  private removeQueuedJob(job: TranscriptionJob): void {
-    const queue = job.priority === "dictation" ? this.dictationQueue : this.fileQueue;
-    const index = queue.indexOf(job);
-    if (index >= 0) queue.splice(index, 1);
+  private abortReservation(state: ReservationState): void {
+    if (state.cancelled || state.result.settled) return;
+    state.cancelled = true;
+    state.accepting = false;
+    state.chunks.length = 0;
+    // Queue native reset before the scheduler can begin another model operation.
+    this.resetStream(state);
+    state.submission.resolve();
+
+    // A submitted reservation waiting behind active work has no native state to
+    // tear down, so preserve the old immediate-cancellation behavior.
+    if (!state.started) {
+      const index = this.dictationQueue.indexOf(state);
+      if (index >= 0) this.dictationQueue.splice(index, 1);
+      this.reservationStates.delete(state);
+      state.removeAbortListener?.();
+      const error = cancellationError(state);
+      state.ready.reject(error);
+      state.result.reject(error);
+    }
+  }
+
+  private resetStream(state: ReservationState): void {
+    const stream = state.stream;
+    state.stream = undefined;
+    stream?.reset();
+  }
+
+  private startDrain(state: ReservationState): void {
+    if (
+      !state.stream ||
+      state.drain ||
+      state.cancelled ||
+      state.streamUnavailable ||
+      state.streamError !== undefined ||
+      state.chunks.length === 0
+    ) {
+      return;
+    }
+
+    const draining = this.drainStream(state).finally(() => {
+      if (state.drain === draining) state.drain = undefined;
+      this.startDrain(state);
+    });
+    state.drain = draining;
+  }
+
+  private async drainStream(state: ReservationState): Promise<void> {
+    const stream = state.stream!;
+    while (
+      state.stream === stream &&
+      !state.cancelled &&
+      state.chunks.length > 0
+    ) {
+      const chunk = state.chunks.shift()!;
+      try {
+        await stream.feed(chunk);
+      } catch (error) {
+        state.streamError = error;
+        state.chunks.length = 0;
+        // A batch fallback may only start after reset has been issued.
+        this.resetStream(state);
+        return;
+      }
+    }
   }
 
   private settleJob(job: TranscriptionJob, settle: () => void): void {
@@ -181,30 +289,31 @@ export class TranscriptionService {
 
   private hasRunnableWork(): boolean {
     if (this.shuttingDown) return false;
-    if (this.dictationQueue.length > 0) return true;
-    if (this.reservation?.active) return !this.reservation.readySettled;
-    return this.fileQueue.length > 0;
+    return (
+      this.dictationQueue.length > 0 ||
+      this.reservation !== undefined ||
+      this.fileQueue.length > 0
+    );
   }
 
   private async process(): Promise<void> {
+    // Model work is non-preemptive. At each operation boundary, submitted
+    // dictation and active recording reservations run before queued file jobs.
+    // An active recording holds the model lane until submit or cancel.
     while (!this.shuttingDown) {
-      const dictation = this.dictationQueue.shift();
-      if (dictation) {
-        await this.runJob(dictation);
+      const queuedDictation = this.dictationQueue.shift();
+      if (queuedDictation) {
+        queuedDictation.started = true;
+        await this.runReservation(queuedDictation);
         continue;
       }
 
       const reservation = this.reservation;
-      if (reservation?.active) {
-        try {
-          await this.ensureModel(reservation.settings.model.path);
-          reservation.resolveReady();
-        } catch (error) {
-          reservation.rejectReady(error);
-        }
-        // A submitted or cancelled reservation changed state while the model loaded.
-        if (!reservation.active || this.reservation !== reservation) continue;
-        return;
+      if (reservation) {
+        reservation.started = true;
+        await this.runReservation(reservation);
+        if (this.reservation === reservation) this.reservation = undefined;
+        continue;
       }
 
       const file = this.fileQueue.shift();
@@ -219,25 +328,160 @@ export class TranscriptionService {
     }
   }
 
+  private async runReservation(state: ReservationState): Promise<void> {
+    try {
+      await this.runReservationWork(state);
+    } finally {
+      state.removeAbortListener?.();
+      this.reservationStates.delete(state);
+    }
+  }
+
+  private settleCancelledReservation(state: ReservationState): void {
+    this.resetStream(state);
+    const error = cancellationError(state);
+    state.ready.reject(error);
+    if (state.submitted) state.result.reject(error);
+  }
+
+  private async runReservationWork(state: ReservationState): Promise<void> {
+    if (state.cancelled) {
+      this.settleCancelledReservation(state);
+      return;
+    }
+
+    let backend: ReusableBackend;
+    try {
+      backend = await this.ensureModel(state.settings.model.path);
+    } catch (error) {
+      if (state.cancelled) {
+        this.settleCancelledReservation(state);
+        return;
+      }
+      state.streamUnavailable = true;
+      state.chunks.length = 0;
+      state.ready.reject(error);
+      await state.submission.promise;
+      if (state.submitted) state.result.reject(error);
+      return;
+    }
+
+    if (state.cancelled) {
+      this.settleCancelledReservation(state);
+      return;
+    }
+
+    // If recording already ended while the model loaded (or while the stream
+    // opened), avoid replaying the complete clip through a newly opened stream
+    // and use the batch path.
+    if (!state.submitted && backend.startStream) {
+      try {
+        const stream = await backend.startStream(
+          transcriptionOptions(state.settings),
+        );
+        if (stream && state.submitted) {
+          stream.reset();
+        } else {
+          state.stream = stream;
+        }
+        if (!state.stream) {
+          state.streamUnavailable = true;
+          state.chunks.length = 0;
+        }
+      } catch (error) {
+        // Stream setup is an optimization; preserve dictation via batch fallback.
+        state.streamError = error;
+        state.chunks.length = 0;
+      }
+    }
+
+    if (state.cancelled) {
+      this.settleCancelledReservation(state);
+      return;
+    }
+
+    state.ready.resolve();
+    this.startDrain(state);
+    await state.submission.promise;
+
+    if (!state.submitted) {
+      this.resetStream(state);
+      return;
+    }
+
+    try {
+      if (state.cancelled || state.signal?.aborted) throw cancellationError(state);
+
+      this.startDrain(state);
+      while (state.drain) await state.drain;
+
+      if (state.cancelled || state.signal?.aborted) throw cancellationError(state);
+
+      const pcm = state.fullPcm!;
+      const stream = state.stream;
+      // An empty clip takes the batch path so it fails exactly as it did before
+      // streaming existed, instead of finalizing a stream that was never fed.
+      if (stream && state.streamError === undefined && pcm.length > 0) {
+        try {
+          const text = await stream.finalize();
+          state.signal?.throwIfAborted();
+          state.result.resolve(text);
+          return;
+        } catch (error) {
+          if (state.signal?.aborted) throw abortError(state.signal);
+          state.streamError = error;
+        } finally {
+          // Idempotent if finalize already released it. This must happen before
+          // the reservation is released and file work is scheduled.
+          if (state.stream === stream) state.stream = undefined;
+          stream.reset();
+        }
+      }
+
+      // Stream setup/feed/finalize failure: reset precedes the batch fallback.
+      this.resetStream(state);
+      state.chunks.length = 0;
+      const text = await this.transcribeBatch(
+        backend,
+        state.settings,
+        pcm,
+        this.withShutdown(state.signal),
+      );
+      state.result.resolve(text);
+    } catch (error) {
+      this.resetStream(state);
+      state.result.reject(
+        state.signal?.aborted ? abortError(state.signal) : error,
+      );
+    }
+  }
+
+  private withShutdown(signal?: AbortSignal): AbortSignal {
+    return signal
+      ? AbortSignal.any([signal, this.shutdownController.signal])
+      : this.shutdownController.signal;
+  }
+
+  /** The single batch path shared by file jobs and the dictation fallback. */
+  private async transcribeBatch(
+    backend: ReusableBackend,
+    settings: TranscribeSettings,
+    pcm: Float32Array,
+    signal: AbortSignal,
+  ): Promise<string> {
+    signal.throwIfAborted();
+    return backend.transcribe(pcm, transcriptionOptions(settings, signal));
+  }
+
   private async runJob(job: TranscriptionJob): Promise<void> {
     if (job.settled) return;
     job.started = true;
-    const signal = job.signal
-      ? AbortSignal.any([job.signal, this.shutdownController.signal])
-      : this.shutdownController.signal;
+    const signal = this.withShutdown(job.signal);
 
     try {
       signal.throwIfAborted();
       const backend = await this.ensureModel(job.settings.model.path);
-      signal.throwIfAborted();
-      const text = await backend.transcribe(job.pcm, {
-        signal,
-        language:
-          job.settings.transcriptionLanguage === "auto"
-            ? undefined
-            : job.settings.transcriptionLanguage,
-        chineseOutput: job.settings.chineseOutput,
-      });
+      const text = await this.transcribeBatch(backend, job.settings, job.pcm, signal);
       this.settleJob(job, () => job.resolve(text));
     } catch (error) {
       this.settleJob(job, () => job.reject(error));
@@ -280,20 +524,25 @@ export class TranscriptionService {
       this.shuttingDown = true;
       this.shutdownController.abort(new Error("pi-transcribe is shutting down"));
       const shutdownError = new Error("pi-transcribe is shutting down");
-      const reservation = this.reservation;
       this.reservation = undefined;
-      if (reservation) {
-        reservation.active = false;
-        reservation.rejectReady(shutdownError);
+      this.dictationQueue.length = 0;
+      for (const reservation of this.reservationStates) {
+        reservation.accepting = false;
+        reservation.cancelled = true;
+        reservation.chunks.length = 0;
+        this.resetStream(reservation);
+        reservation.ready.reject(shutdownError);
+        reservation.result.reject(shutdownError);
+        reservation.submission.resolve();
       }
-      for (const job of [...this.dictationQueue, ...this.fileQueue]) {
+      for (const job of this.fileQueue) {
         this.settleJob(job, () => job.reject(shutdownError));
       }
-      this.dictationQueue.length = 0;
       this.fileQueue.length = 0;
     }
 
     await this.loop?.catch(() => undefined);
+    this.reservationStates.clear();
     await this.unloadModel().catch(() => undefined);
   }
 }

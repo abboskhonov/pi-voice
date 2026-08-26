@@ -1,11 +1,7 @@
-export function deferred(): { promise: Promise<void>; resolve(): void } {
-  let resolve!: () => void;
-  return {
-    promise: new Promise<void>((done) => {
-      resolve = done;
-    }),
-    resolve: () => resolve(),
-  };
+import { Deferred } from "../src/deferred.js";
+
+export function deferred(): Deferred {
+  return new Deferred();
 }
 
 export function nextTurn(): Promise<void> {
