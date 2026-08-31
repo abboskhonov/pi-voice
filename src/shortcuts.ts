@@ -169,12 +169,3 @@ export function createShortcutPicker(
     },
   };
 }
-
-export async function chooseShortcut(
-  ctx: ExtensionContext,
-  current = DEFAULT_SHORTCUT,
-): Promise<string | undefined> {
-  return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) =>
-    createShortcutPicker(tui, theme, keybindings, current, done),
-  );
-}

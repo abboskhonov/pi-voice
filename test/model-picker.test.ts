@@ -9,8 +9,21 @@ import {
   TUI_KEYBINDINGS,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { CatalogModelPicker } from "../src/model-picker.js";
+import {
+  CatalogModelPicker,
+  createTranscriptionLanguagePicker,
+  LanguagePicker,
+  type CatalogModelPickerResult,
+  type CatalogModelPostActivation,
+} from "../src/model-picker.js";
+import { getRepoFolderName } from "@huggingface/hub";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CATALOG_MODELS, type CatalogModel } from "../src/catalog.js";
+
+// Keep cache and partial-download probes away from the real Hugging Face cache.
+process.env.HF_HUB_CACHE = mkdtempSync(join(tmpdir(), "pi-transcribe-picker-"));
 
 initTheme("dark");
 
@@ -22,6 +35,7 @@ function testTheme(): ExtensionContext["ui"]["theme"] {
   return {
     fg: (_color: string, text: string) => text,
     bold: (text: string) => text,
+    inverse: (text: string) => text,
   } as unknown as ExtensionContext["ui"]["theme"];
 }
 
@@ -43,19 +57,22 @@ type PickerInternals = {
   cachedById: Map<string, unknown>;
   mode: string;
   downloadSamples: { t: number; bytes: number }[];
+  filtered: CatalogModel[];
   refresh: () => void;
 };
 
 /** A picker in which no model is cached, with a manually driven activation. */
-function controlledPicker(): {
+function controlledPicker(postActivation: CatalogModelPostActivation = "stay"): {
   picker: CatalogModelPicker;
   internals: PickerInternals;
   resolve: (path: string) => void;
   reject: (error: unknown) => void;
   signal: () => AbortSignal;
   progress: (downloaded: number, total: number) => void;
+  result: () => CatalogModelPickerResult | undefined;
 } {
   let options: ActivationOptions | undefined;
+  let completed: CatalogModelPickerResult | undefined;
   let resolveActivation!: (value: { path: string }) => void;
   let rejectActivation!: (error: unknown) => void;
   const picker = new CatalogModelPicker(
@@ -64,7 +81,9 @@ function controlledPicker(): {
     keybindings(),
     ["en"],
     undefined,
-    () => undefined,
+    (result) => {
+      completed = result;
+    },
     (_model: CatalogModel, activationOptions: ActivationOptions) => {
       options = activationOptions;
       return new Promise<{ path: string }>((resolvePromise, rejectPromise) => {
@@ -72,6 +91,7 @@ function controlledPicker(): {
         rejectActivation = rejectPromise;
       });
     },
+    { postActivation },
   );
   const internals = picker as unknown as PickerInternals;
   // Deterministic regardless of the developer's local Hugging Face cache.
@@ -84,6 +104,7 @@ function controlledPicker(): {
     reject: (error) => rejectActivation(error),
     signal: () => options!.signal,
     progress: (downloaded, total) => options!.onProgress({ downloaded, total }),
+    result: () => completed,
   };
 }
 
@@ -98,6 +119,7 @@ test("enter on an uncached model starts the download immediately", (t) => {
   // The detail pane carries the model facts; the footer carries the action.
   assert.match(body, /English only|\d+ languages/);
   assert.match(body, /enter.*download \d/);
+  assert.equal((stripAnsi(body).match(/tab change/gi) ?? []).length, 1);
 
   picker.handleInput(ENTER);
   assert.equal(internals.mode, "downloading");
@@ -129,49 +151,25 @@ test("download stats include a rolling speed and ETA", (t) => {
   assert.match(body, /~\d+(s| min) left/);
 });
 
-test("esc during a download asks before stopping, and stop aborts", async (t) => {
+test("esc during a download stops it immediately and keeps progress", async (t) => {
   const { picker, internals, signal, progress, reject } = controlledPicker();
   t.after(() => picker.dispose());
   picker.handleInput(ENTER);
   progress(1_000_000_000, 3_000_000_000);
+  assert.match(rendered(picker), /stop \(keeps progress\)/);
 
   picker.handleInput(ESC);
-  assert.equal(internals.mode, "confirm-cancel");
-  const prompt = rendered(picker);
-  assert.match(prompt, /Stop downloading .*\?/);
-  assert.match(prompt, /stopping discards it/);
-  assert.match(prompt, /→ Keep downloading/);
-
-  // Enter on the default choice keeps the download running.
-  picker.handleInput(ENTER);
-  assert.equal(internals.mode, "downloading");
-  assert.equal(signal().aborted, false);
-
-  // Esc again, move to "Stop download", confirm.
-  picker.handleInput(ESC);
-  picker.handleInput(DOWN);
-  assert.match(rendered(picker), /→ Stop download/);
-  picker.handleInput(ENTER);
   assert.equal(signal().aborted, true);
-  assert.equal(internals.mode, "downloading");
-  assert.match(rendered(picker), /Cancelling…/);
+  assert.match(rendered(picker), /Stopping…/);
 
-  // The aborted activation rejects; the picker returns to the list quietly.
+  // The aborted activation rejects; the picker returns to the list and
+  // explains that the progress was kept.
   reject(new Error("aborted"));
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(internals.mode, "models");
-  assert.match(rendered(picker), /67 models/);
-});
-
-test("esc in the stop prompt keeps downloading", (t) => {
-  const { picker, internals, signal } = controlledPicker();
-  t.after(() => picker.dispose());
-  picker.handleInput(ENTER);
-  picker.handleInput(ESC);
-  assert.equal(internals.mode, "confirm-cancel");
-  picker.handleInput(ESC);
-  assert.equal(internals.mode, "downloading");
-  assert.equal(signal().aborted, false);
+  const body = rendered(picker);
+  assert.match(body, /67 models/);
+  assert.match(body, /Download stopped — progress saved/);
 });
 
 test("a finished download reports success and marks the model downloaded", async (t) => {
@@ -185,6 +183,31 @@ test("a finished download reports success and marks the model downloaded", async
   assert.match(body, /✓ Downloaded and selected /);
   assert.match(body, /Current: /);
   assert.ok(internals.cachedById.size > 0);
+});
+
+test("advance post-activation policy completes immediately", async (t) => {
+  const { picker, resolve, result } = controlledPicker("advance");
+  t.after(() => picker.dispose());
+  picker.handleInput(ENTER);
+  resolve("/tmp/model.bin");
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+
+  assert.deepEqual(result(), { type: "complete" });
+});
+
+test("advance policy also skips an extra pane for a downloaded model", async (t) => {
+  const { picker, internals, resolve, result } = controlledPicker("advance");
+  t.after(() => picker.dispose());
+  const highlighted = internals.filtered[0]!;
+  internals.cachedById.set(highlighted.id, { path: "/tmp/model.bin" });
+  internals.refresh();
+
+  picker.handleInput(ENTER);
+  resolve("/tmp/model.bin");
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+
+  assert.deepEqual(result(), { type: "complete" });
+  assert.doesNotMatch(stripAnsi(rendered(picker)), /Model ready/);
 });
 
 test("size and downloaded columns stay aligned and rows never wrap", (t) => {
@@ -215,6 +238,76 @@ test("size and downloaded columns stay aligned and rows never wrap", (t) => {
   }
 });
 
-function visibleLength(line: string): number {
-  return line.replace(/\u001b\[[0-9;]*m/g, "").length;
+function stripAnsi(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*m/g, "");
 }
+
+function visibleLength(line: string): number {
+  return stripAnsi(line).length;
+}
+
+test("language picker shows tab-to-continue inline on the action row", () => {
+  const picker = new LanguagePicker(
+    testTui(),
+    testTheme(),
+    keybindings(),
+    ["en"],
+    "skip for now",
+    () => undefined,
+  );
+
+  const actionLine = picker.render(80).map(stripAnsi).find((line) => /tab\s+Continue/i.test(line));
+  assert.ok(actionLine);
+  assert.doesNotMatch(actionLine, /move|select|skip for now/);
+});
+
+test("transcription language picker keeps auto detect, codes, and preferred stars", () => {
+  const model = CATALOG_MODELS.find(
+    (candidate) => candidate.capabilities.languageDetection && candidate.languages.length > 5,
+  )!;
+  let chosen: string | undefined;
+  const picker = createTranscriptionLanguagePicker(
+    testTui(),
+    testTheme(),
+    keybindings(),
+    model,
+    "auto",
+    ["en"],
+    (language) => {
+      chosen = language;
+    },
+  );
+  const lines = picker.render(80);
+  assert.ok(lines.some((line) => line.includes("→ ● Auto detect")));
+  // Multiple English variants keep their regional labels and codes.
+  assert.ok(lines.some((line) => /English\s+en-US  ★/.test(line)));
+  assert.ok(lines.some((line) => line.includes("★ preferred language")));
+  picker.handleInput(ENTER);
+  assert.equal(chosen, "auto");
+});
+
+test("only an exact-hash partial switches the footer to resume", (t) => {
+  const { picker, internals } = controlledPicker();
+  t.after(() => picker.dispose());
+  const highlighted = internals.filtered[0]!;
+  const blobsDirectory = join(
+    process.env.HF_HUB_CACHE!,
+    getRepoFolderName({ name: highlighted.repository, type: "model" }),
+    "blobs",
+  );
+  mkdirSync(blobsDirectory, { recursive: true });
+
+  // A stale partial from another revision must not promise a resume.
+  const stalePath = join(blobsDirectory, `${"0".repeat(64)}.incomplete`);
+  writeFileSync(stalePath, Buffer.alloc(1024, 1));
+  t.after(() => rmSync(stalePath, { force: true }));
+  internals.refresh();
+  assert.match(rendered(picker), /download \d/);
+  assert.doesNotMatch(rendered(picker), /resume download/);
+
+  const partialPath = join(blobsDirectory, `${highlighted.sha256}.incomplete`);
+  writeFileSync(partialPath, Buffer.alloc(1024, 1));
+  t.after(() => rmSync(partialPath, { force: true }));
+  internals.refresh();
+  assert.match(rendered(picker), /resume download/);
+});

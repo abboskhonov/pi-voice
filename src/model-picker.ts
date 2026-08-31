@@ -1,5 +1,6 @@
 import {
   keyHint,
+  keyText,
   rawKeyHint,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -30,12 +31,18 @@ import {
   rankCatalogModels,
   type CatalogModel,
 } from "./catalog.js";
-import { findCachedCatalogModel, type CachedCatalogModel } from "./models.js";
+import {
+  findCachedCatalogModel,
+  findIncompleteDownload,
+  type CachedCatalogModel,
+} from "./models.js";
 import type { TranscriptionLanguage } from "./settings.js";
 import {
   LIST_PADDING,
   PANEL_PADDING,
   panelBorder,
+  SingleSelectPicker,
+  type SingleSelectChoice,
 } from "./ui-components.js";
 
 type UiTheme = ExtensionContext["ui"]["theme"];
@@ -235,11 +242,14 @@ export class LanguagePicker extends Container implements Focusable {
     if (this.showContinue) {
       const onContinue = this.selectedIndex === this.continueRowIndex();
       const continuePrefix = onContinue ? this.theme.fg("accent", "→ ") : "  ";
+      const continueAction = ` ${keyText("tui.input.tab")}  Continue `;
       const continueRow = selected.length === 0
         ? this.theme.fg("warning", "Select at least one language to continue")
-        : onContinue
-          ? this.theme.fg("accent", this.theme.bold("Continue"))
-          : this.theme.fg("success", "Continue");
+        : this.theme.inverse(
+            onContinue
+              ? this.theme.fg("accent", this.theme.bold(continueAction))
+              : this.theme.fg("success", continueAction),
+          );
       this.list.addChild(new Spacer(1));
       this.list.addChild(new Text(`${continuePrefix}${continueRow}`, LIST_PADDING, 0));
     }
@@ -325,6 +335,15 @@ export type CatalogModelPickerResult =
   | { type: "change-languages" }
   | { type: "complete" };
 
+export type CatalogModelPostActivation = "stay" | "advance";
+
+export type CatalogModelPickerOptions = {
+  /** What the host does after activation and its settings commit succeed. */
+  postActivation?: CatalogModelPostActivation;
+  /** The host is reopening this picker after an activation in the same flow. */
+  activatedInFlow?: boolean;
+};
+
 export type CatalogModelActivation = (
   model: CatalogModel,
   options: {
@@ -334,7 +353,7 @@ export type CatalogModelActivation = (
   },
 ) => Promise<{ path: string }>;
 
-type CatalogModelPickerMode = "models" | "downloading" | "confirm-cancel";
+type CatalogModelPickerMode = "models" | "downloading";
 
 export class CatalogModelPicker extends Container implements Focusable {
   private readonly search = new Input();
@@ -358,6 +377,7 @@ export class CatalogModelPicker extends Container implements Focusable {
   /** Last selection whose activation finished; what settings actually hold. */
   private committedModelId: string | undefined;
   private mode: CatalogModelPickerMode = "models";
+  private readonly postActivation: CatalogModelPostActivation;
   /** Latest selection still activating; a newer selection supersedes it. */
   private target: { model: CatalogModel; controller: AbortController } | undefined;
   /** Exit requested while a save was in flight; fires when the save lands. */
@@ -366,10 +386,7 @@ export class CatalogModelPicker extends Container implements Focusable {
   private downloadTotal = 0;
   private downloadSamples: { t: number; bytes: number }[] = [];
   private downloadSpinner: Loader | undefined;
-  /** Highlighted option in the stop-download prompt (0 = keep, 1 = stop). */
-  private cancelChoice = 0;
-  private cancelPromptDetail = "";
-  private feedback: { type: "success" | "error"; text: string } | undefined;
+  private feedback: { type: "success" | "error" | "muted"; text: string } | undefined;
   private selectedDuringSession = false;
   private disposed = false;
   private _focused = false;
@@ -391,12 +408,12 @@ export class CatalogModelPicker extends Container implements Focusable {
     currentModelId: string | undefined,
     private readonly done: (result: CatalogModelPickerResult | undefined) => void,
     private readonly onActivate: CatalogModelActivation,
-    private readonly continueAfterActivation = false,
-    alreadyActivated = false,
+    options: CatalogModelPickerOptions = {},
   ) {
     super();
     this.committedModelId = currentModelId;
-    this.selectedDuringSession = alreadyActivated;
+    this.postActivation = options.postActivation ?? "stay";
+    this.selectedDuringSession = options.activatedInFlow ?? false;
     for (const model of CATALOG_MODELS) {
       const cached = findCachedCatalogModel(model);
       if (cached) this.cachedById.set(model.id, cached);
@@ -464,9 +481,7 @@ export class CatalogModelPicker extends Container implements Focusable {
   private refresh(): void {
     this.body.clear();
     const preferredAction = this.selectedDuringSession
-      ? this.continueAfterActivation
-        ? ` · ${keyHint("tui.input.tab", "continue")}`
-        : ""
+      ? ""
       : ` · ${keyHint("tui.input.tab", "change")}`;
     const languagesText = truncateToWidth(
       `Languages: ${this.preferredLanguages.map(displayLanguage).join(", ")}`,
@@ -518,35 +533,7 @@ export class CatalogModelPicker extends Container implements Focusable {
       );
       this.body.addChild(new Spacer(1));
       this.body.addChild(
-        new Text(keyHint("tui.select.cancel", "stop"), TEXT_PADDING, 0),
-      );
-      this.tui.requestRender();
-      return;
-    }
-
-    if (this.mode === "confirm-cancel") {
-      const model = this.target!.model;
-      this.body.addChild(new Spacer(1));
-      this.body.addChild(
-        new Text(this.theme.bold(`Stop downloading ${model.name}?`), TEXT_PADDING, 0),
-      );
-      this.body.addChild(
-        new Text(this.theme.fg("muted", this.cancelPromptDetail), TEXT_PADDING, 0),
-      );
-      this.body.addChild(new Spacer(1));
-      for (const [index, option] of ["Keep downloading", "Stop download"].entries()) {
-        const active = index === this.cancelChoice;
-        const prefix = active ? this.theme.fg("accent", "→ ") : "  ";
-        const label = active ? this.theme.fg("accent", option) : option;
-        this.body.addChild(new Text(`${prefix}${label}`, TEXT_PADDING, 0));
-      }
-      this.body.addChild(new Spacer(1));
-      this.body.addChild(
-        new Text(
-          `${rawKeyHint("↑↓", "choose")}  ${keyHint("tui.select.confirm", "confirm")}  ${keyHint("tui.select.cancel", "keep downloading")}`,
-          TEXT_PADDING,
-          0,
-        ),
+        new Text(keyHint("tui.select.cancel", "stop (keeps progress)"), TEXT_PADDING, 0),
       );
       this.tui.requestRender();
       return;
@@ -646,17 +633,16 @@ export class CatalogModelPicker extends Container implements Focusable {
     ]
       .filter((value): value is string => Boolean(value))
       .join("  ");
-    const continueHint = this.selectedDuringSession && this.continueAfterActivation
-      ? `  ${keyHint("tui.input.tab", "continue")}`
-      : "";
     const closeLabel = query ? "clear search" : this.selectedDuringSession ? "back" : "cancel";
     // The confirm key says what it will do for the highlighted model.
     const highlighted = this.filtered[this.selectedIndex];
     const confirmLabel = highlighted && !this.cachedById.has(highlighted.id)
-      ? `download ${formatBinarySize(highlighted.size)}`
+      ? findIncompleteDownload(highlighted)
+        ? "resume download"
+        : `download ${formatBinarySize(highlighted.size)}`
       : "choose";
     this.footer.setText(
-      `${this.theme.fg("dim", shown)}  ${statusLegend}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", confirmLabel)}${continueHint}  ${keyHint("tui.select.cancel", closeLabel)}`,
+      `${this.theme.fg("dim", shown)}  ${statusLegend}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", confirmLabel)}  ${keyHint("tui.select.cancel", closeLabel)}`,
     );
     this.tui.requestRender();
   }
@@ -703,17 +689,32 @@ export class CatalogModelPicker extends Container implements Focusable {
     this.done(result);
   }
 
+  private applyPostActivation(model: CatalogModel, wasCached: boolean): void {
+    if (this.postActivation === "advance") {
+      this.done({ type: "complete" });
+      return;
+    }
+    this.mode = "models";
+    this.feedback = {
+      type: "success",
+      text: wasCached
+        ? `Selected ${model.name}`
+        : `✓ Downloaded and selected ${model.name}`,
+    };
+    this.refresh();
+  }
+
   private startActivation(model: CatalogModel): void {
     const cached = this.cachedById.get(model.id);
-    // Re-selecting the active model is a no-op unless an activation is still
-    // needed to unlock the "continue" affordance.
+    // A committed model needs no further activation. Apply this host's policy:
+    // settings stay in the picker, while onboarding advances immediately.
     if (
       model.id === this.displayedModelId() &&
       cached &&
-      (this.selectedDuringSession || !this.continueAfterActivation)
+      (this.selectedDuringSession || this.postActivation === "stay")
     ) {
-      this.feedback = undefined;
-      this.refresh();
+      this.selectedDuringSession = true;
+      this.applyPostActivation(model, true);
       return;
     }
 
@@ -745,12 +746,17 @@ export class CatalogModelPicker extends Container implements Focusable {
       signal: controller.signal,
       onProgress: ({ downloaded, total }) => {
         if (this.disposed || controller.signal.aborted || this.target !== activation) return;
+        const firstReport = this.downloadTotal === 0 && total > 0;
         this.downloadBytes = downloaded;
         this.downloadTotal = total;
         this.downloadSamples.push({ t: Date.now(), bytes: downloaded });
         if (this.downloadSamples.length > 64) this.downloadSamples.shift();
-        if (downloaded === 0) {
-          this.downloadSpinner?.setMessage("Downloading from Hugging Face…");
+        if (firstReport) {
+          this.downloadSpinner?.setMessage(
+            downloaded > 0
+              ? "Resuming download from Hugging Face…"
+              : "Downloading from Hugging Face…",
+          );
         }
         this.refresh();
       },
@@ -764,19 +770,14 @@ export class CatalogModelPicker extends Container implements Focusable {
         if (this.target === activation) {
           this.target = undefined;
           this.stopSpinner();
-          if (this.mode !== "models") this.mode = "models";
-          this.feedback = {
-            type: "success",
-            text: cached
-              ? `Selected ${model.name}`
-              : `✓ Downloaded and selected ${model.name}`,
-          };
           const exit = this.pendingExit;
           if (exit) {
             this.pendingExit = undefined;
             this.done(exit.result);
             return;
           }
+          if (!this.disposed) this.applyPostActivation(model, Boolean(cached));
+          return;
         }
         if (!this.disposed) this.refresh();
       },
@@ -790,9 +791,14 @@ export class CatalogModelPicker extends Container implements Focusable {
           this.stopSpinner();
           // A requested exit is cancelled so the failure stays visible.
           this.pendingExit = undefined;
-          if (this.mode !== "models") this.mode = "models";
+          this.mode = "models";
           this.feedback = controller.signal.aborted
-            ? undefined
+            ? {
+                type: "muted",
+                text: this.downloadBytes > 0
+                  ? "Download stopped — progress saved. Select the model again to resume."
+                  : "Download stopped.",
+              }
             : {
                 type: "error",
                 text: `Could not select ${model.name}: ${error instanceof Error ? error.message : String(error)}`,
@@ -809,52 +815,18 @@ export class CatalogModelPicker extends Container implements Focusable {
     if (this.mode === "downloading") {
       // Downloading is the one modal state: the progress panel is visible, so
       // ignoring everything except cancel cannot read as a dead keyboard.
-      // Cancel asks first — an accidental Esc must not throw away a nearly
-      // finished multi-gigabyte download. The download keeps running while
-      // the prompt is open.
+      // Stopping is cheap: the partial file stays in the cache, and selecting
+      // the model again resumes from where it left off.
       if (this.keybindings.matches(data, "tui.select.cancel") && this.target) {
-        this.cancelChoice = 0;
-        this.cancelPromptDetail =
-          this.downloadTotal > 0 && this.downloadBytes > 0
-            ? `${formatBinarySize(this.downloadBytes)} of ${formatBinarySize(this.downloadTotal)} downloaded — stopping discards it.`
-            : "Nothing has been downloaded yet.";
-        this.mode = "confirm-cancel";
-        this.refresh();
-      }
-      return;
-    }
-
-    if (this.mode === "confirm-cancel") {
-      if (
-        this.keybindings.matches(data, "tui.select.up") ||
-        this.keybindings.matches(data, "tui.select.down")
-      ) {
-        this.cancelChoice = this.cancelChoice === 0 ? 1 : 0;
-        this.refresh();
-        return;
-      }
-      if (this.keybindings.matches(data, "tui.select.confirm")) {
-        if (this.cancelChoice === 1 && this.target) {
-          this.target.controller.abort();
-          this.downloadSpinner?.setMessage("Cancelling…");
-        }
-        this.mode = "downloading";
-        this.refresh();
-        return;
-      }
-      if (this.keybindings.matches(data, "tui.select.cancel")) {
-        this.mode = "downloading";
+        this.target.controller.abort();
+        this.downloadSpinner?.setMessage("Stopping…");
         this.refresh();
       }
       return;
     }
 
     if (this.keybindings.matches(data, "tui.input.tab")) {
-      if (this.selectedDuringSession) {
-        if (this.continueAfterActivation) this.requestExit({ type: "complete" });
-      } else {
-        this.requestExit({ type: "change-languages" });
-      }
+      if (!this.selectedDuringSession) this.requestExit({ type: "change-languages" });
       return;
     }
     if (this.keybindings.matches(data, "tui.select.up")) {
@@ -884,8 +856,6 @@ export class CatalogModelPicker extends Container implements Focusable {
         this.search.setValue("");
         this.selectedIndex = 0;
         this.refresh();
-      } else if (this.selectedDuringSession && this.continueAfterActivation) {
-        this.requestExit({ type: "change-languages" });
       } else {
         this.requestExit(undefined);
       }
@@ -902,7 +872,7 @@ export class CatalogModelPicker extends Container implements Focusable {
     this.stopSpinner();
     // Closing cancels only a download; a queued settings commit still lands
     // because the user's Enter already chose it.
-    if (this.mode !== "models") this.target?.controller.abort();
+    if (this.mode === "downloading") this.target?.controller.abort();
   }
 }
 
@@ -934,10 +904,9 @@ export async function chooseCatalogModel(
   currentModelId: string | undefined,
   options: {
     onActivate: CatalogModelActivation;
-    continueAfterActivation?: boolean;
-    /** A model was already activated earlier in this flow, so the picker
-     * opens with the post-selection affordances (tab continue, esc back). */
-    alreadyActivated?: boolean;
+    postActivation?: CatalogModelPostActivation;
+    /** A model was already activated earlier in this flow. */
+    activatedInFlow?: boolean;
   },
 ): Promise<CatalogModelPickerResult | undefined> {
   return ctx.ui.custom<CatalogModelPickerResult | undefined>(
@@ -950,205 +919,12 @@ export async function chooseCatalogModel(
         currentModelId,
         done,
         options.onActivate,
-        options.continueAfterActivation,
-        options.alreadyActivated,
+        {
+          postActivation: options.postActivation,
+          activatedInFlow: options.activatedInFlow,
+        },
       ),
   );
-}
-
-type TranscriptionLanguageChoice = {
-  value: TranscriptionLanguage;
-  name: string;
-  preferred: boolean;
-};
-
-export class TranscriptionLanguagePicker extends Container implements Focusable {
-  private readonly search = new Input();
-  private readonly list = new Container();
-  private readonly footer = new Text("", TEXT_PADDING, 0);
-  private readonly choices: TranscriptionLanguageChoice[];
-  private filtered: TranscriptionLanguageChoice[] = [];
-  private selectedIndex = 0;
-  private readonly current: TranscriptionLanguage;
-  private _focused = false;
-
-  get focused(): boolean {
-    return this._focused;
-  }
-
-  set focused(value: boolean) {
-    this._focused = value;
-    this.search.focused = value;
-  }
-
-  constructor(
-    private readonly tui: TUI,
-    private readonly theme: UiTheme,
-    private readonly keybindings: KeybindingsManager,
-    model: CatalogModel,
-    current: TranscriptionLanguage,
-    preferredLanguages: readonly string[],
-    private readonly done: (language: TranscriptionLanguage | undefined) => void,
-  ) {
-    super();
-    this.current = current;
-    const preferred = new Set(preferredLanguages.map(canonicalLanguage));
-    const languages = [...new Set(model.languages)]
-      .map((language) => ({
-        value: language,
-        name: transcriptionLanguageName(language, model.languages),
-        preferred: preferred.has(canonicalLanguage(language)),
-      }))
-      .sort(
-        (left, right) =>
-          Number(right.preferred) - Number(left.preferred) ||
-          left.name.localeCompare(right.name) ||
-          left.value.localeCompare(right.value),
-      );
-    this.choices = [
-      ...(model.capabilities.languageDetection
-        ? [{ value: "auto", name: "Auto detect", preferred: false }]
-        : []),
-      ...languages,
-    ];
-    this.filtered = this.choices;
-    this.selectedIndex = Math.max(
-      0,
-      this.choices.findIndex((choice) => choice.value === current),
-    );
-
-    this.addChild(panelBorder(theme));
-    this.addChild(new Spacer(1));
-    this.addChild(
-      new Text(theme.fg("accent", theme.bold("Choose transcription language")), TEXT_PADDING, 0),
-    );
-    this.addChild(
-      new Text(
-        theme.fg(
-          "muted",
-          model.capabilities.languageDetection
-            ? "Choose the language expected in recordings, or let the model detect it automatically."
-            : "Choose the language expected in recordings.",
-        ),
-        TEXT_PADDING,
-        0,
-      ),
-    );
-    this.addChild(new Spacer(1));
-    // The search caret sits in the gutter, aligned with the list cursor; its
-    // "> " prompt then puts the typed query on the content edge.
-    const searchBox = new Box(LIST_PADDING, 0);
-    searchBox.addChild(this.search);
-    this.addChild(searchBox);
-    this.addChild(new Spacer(1));
-    this.addChild(this.list);
-    this.addChild(new Spacer(1));
-    this.addChild(this.footer);
-    this.addChild(new Spacer(1));
-    this.addChild(panelBorder(theme));
-    this.refresh();
-  }
-
-  private refresh(): void {
-    const query = this.search.getValue().trim();
-    this.filtered = query
-      ? fuzzyFilter(this.choices, query, (choice) => `${choice.name} ${choice.value}`)
-      : this.choices;
-    this.selectedIndex = Math.min(
-      this.selectedIndex,
-      Math.max(0, this.filtered.length - 1),
-    );
-    this.list.clear();
-
-    if (this.filtered.length === 0) {
-      this.list.addChild(new Text(this.theme.fg("muted", "  No matching languages"), LIST_PADDING, 0));
-    } else {
-      const [start, end] = selectedWindow(
-        this.filtered,
-        this.selectedIndex,
-        MAX_VISIBLE_LANGUAGES,
-      );
-      for (let index = start; index < end; index += 1) {
-        const choice = this.filtered[index]!;
-        const active = index === this.selectedIndex;
-        const prefix = active ? this.theme.fg("accent", "→ ") : "  ";
-        const current = choice.value === this.current
-          ? this.theme.fg("accent", "● ")
-          : "  ";
-        const nameText = padColumn(choice.name, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
-        const name = active ? this.theme.fg("accent", nameText) : nameText;
-        const code = choice.value === "auto" ? "" : this.theme.fg("dim", choice.value);
-        const yours = choice.preferred ? `  ${this.theme.fg("accent", "★")}` : "";
-        this.list.addChild(new Text(`${prefix}${current}${name}  ${code}${yours}`, LIST_PADDING, 0));
-      }
-      if (start > 0 || end < this.filtered.length) {
-        this.list.addChild(
-          new Text(
-            this.theme.fg(
-              "muted",
-              `  (${this.selectedIndex + 1}/${this.filtered.length})`,
-            ),
-            LIST_PADDING,
-            0,
-          ),
-        );
-      }
-    }
-
-    const shown = query
-      ? `${this.filtered.length}/${this.choices.length} matching languages`
-      : `${this.choices.length} choices`;
-    const legend = [
-      `${this.theme.fg("accent", "●")} ${this.theme.fg("dim", "current")}`,
-      this.choices.some((choice) => choice.preferred)
-        ? `${this.theme.fg("accent", "★")} ${this.theme.fg("dim", "preferred language")}`
-        : undefined,
-    ]
-      .filter((value): value is string => Boolean(value))
-      .join("  ");
-    this.footer.setText(
-      `${this.theme.fg("dim", shown)}  ${legend}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "choose")}  ${keyHint("tui.select.cancel", query ? "clear search" : "cancel")}`,
-    );
-    this.tui.requestRender();
-  }
-
-  handleInput(data: string): void {
-    if (this.keybindings.matches(data, "tui.select.up")) {
-      if (this.filtered.length > 0) {
-        this.selectedIndex =
-          this.selectedIndex === 0 ? this.filtered.length - 1 : this.selectedIndex - 1;
-        this.refresh();
-      }
-      return;
-    }
-    if (this.keybindings.matches(data, "tui.select.down")) {
-      if (this.filtered.length > 0) {
-        this.selectedIndex =
-          this.selectedIndex === this.filtered.length - 1 ? 0 : this.selectedIndex + 1;
-        this.refresh();
-      }
-      return;
-    }
-    if (this.keybindings.matches(data, "tui.select.confirm")) {
-      const selected = this.filtered[this.selectedIndex];
-      if (selected) this.done(selected.value);
-      return;
-    }
-    if (this.keybindings.matches(data, "tui.select.cancel")) {
-      if (this.search.getValue()) {
-        this.search.setValue("");
-        this.selectedIndex = 0;
-        this.refresh();
-      } else {
-        this.done(undefined);
-      }
-      return;
-    }
-
-    this.search.handleInput(data);
-    this.selectedIndex = 0;
-    this.refresh();
-  }
 }
 
 export function transcriptionLanguageSummary(
@@ -1160,22 +936,63 @@ export function transcriptionLanguageSummary(
     : transcriptionLanguageName(language, model.languages);
 }
 
-export async function chooseTranscriptionLanguage(
-  ctx: ExtensionContext,
+/** Single-choice picker over a model's transcription languages. */
+export function createTranscriptionLanguagePicker(
+  tui: TUI,
+  theme: UiTheme,
+  keybindings: KeybindingsManager,
   model: CatalogModel,
   current: TranscriptionLanguage,
   preferredLanguages: readonly string[],
-): Promise<TranscriptionLanguage | undefined> {
-  return ctx.ui.custom<TranscriptionLanguage | undefined>(
-    (tui, theme, keybindings, done) =>
-      new TranscriptionLanguagePicker(
-        tui,
-        theme,
-        keybindings,
-        model,
-        current,
-        preferredLanguages,
-        done,
-      ),
+  done: (language: TranscriptionLanguage | undefined) => void,
+): SingleSelectPicker<TranscriptionLanguage> {
+  const preferred = new Set(preferredLanguages.map(canonicalLanguage));
+  const isPreferred = (value: TranscriptionLanguage): boolean =>
+    value !== "auto" && preferred.has(canonicalLanguage(value));
+  const languages: SingleSelectChoice<TranscriptionLanguage>[] = [
+    ...new Set(model.languages),
+  ]
+    .map((language) => ({
+      value: language,
+      label: transcriptionLanguageName(language, model.languages),
+    }))
+    .sort(
+      (left, right) =>
+        Number(isPreferred(right.value)) - Number(isPreferred(left.value)) ||
+        left.label.localeCompare(right.label) ||
+        left.value.localeCompare(right.value),
+    );
+  const choices: SingleSelectChoice<TranscriptionLanguage>[] = [
+    ...(model.capabilities.languageDetection
+      ? [{ value: "auto", label: "Auto detect" }]
+      : []),
+    ...languages,
+  ];
+  return new SingleSelectPicker(
+    tui,
+    theme,
+    keybindings,
+    choices,
+    current,
+    {
+      title: "Choose transcription language",
+      subtitle: model.capabilities.languageDetection
+        ? "Choose the language expected in recordings, or let the model detect it automatically."
+        : "Choose the language expected in recordings.",
+      searchable: true,
+      maximumVisible: MAX_VISIBLE_LANGUAGES,
+      cancelLabel: "back",
+      legend: choices.some((choice) => isPreferred(choice.value))
+        ? `${theme.fg("accent", "★")} ${theme.fg("dim", "preferred language")}`
+        : undefined,
+      renderLabel: (choice, active) => {
+        const nameText = padColumn(choice.label, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
+        const name = active ? theme.fg("accent", nameText) : nameText;
+        const code = choice.value === "auto" ? "" : theme.fg("dim", choice.value);
+        const yours = isPreferred(choice.value) ? `  ${theme.fg("accent", "★")}` : "";
+        return `${name}  ${code}${yours}`;
+      },
+    },
+    done,
   );
 }

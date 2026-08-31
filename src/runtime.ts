@@ -110,7 +110,7 @@ export function createPiTranscribeRuntime(
       chineseOutput: previous.chineseOutput,
       currentModelId: previous.model.id,
       microphone: previous.microphone,
-      continueAfterSelection: true,
+      postActivation: "advance",
     });
     if (configured) rememberSettings(configured);
     return configured;

@@ -72,6 +72,10 @@ export class SingleSelectPicker<T extends string> extends Container implements F
       searchable?: boolean;
       maximumVisible?: number;
       cancelLabel?: string;
+      /** Extra footer legend, appended after the ● current marker. */
+      legend?: string;
+      /** Custom row body after the cursor and ● markers; handles its own active styling. */
+      renderLabel?: (choice: SingleSelectChoice<T>, active: boolean) => string;
     },
     private readonly done: (value: T | undefined) => void,
   ) {
@@ -104,8 +108,10 @@ export class SingleSelectPicker<T extends string> extends Container implements F
     }
     this.addChild(this.list);
     this.addChild(new Spacer(1));
-    this.addChild(this.detail);
-    this.addChild(new Spacer(1));
+    if (choices.some((choice) => choice.description)) {
+      this.addChild(this.detail);
+      this.addChild(new Spacer(1));
+    }
     this.addChild(this.footer);
     this.addChild(new Spacer(1));
     this.addChild(panelBorder(theme));
@@ -144,7 +150,11 @@ export class SingleSelectPicker<T extends string> extends Container implements F
         const current = choice.value === this.current
           ? this.theme.fg("accent", "● ")
           : "  ";
-        const label = active ? this.theme.fg("accent", choice.label) : choice.label;
+        const label = this.options.renderLabel
+          ? this.options.renderLabel(choice, active)
+          : active
+            ? this.theme.fg("accent", choice.label)
+            : choice.label;
         this.list.addChild(new Text(`${prefix}${current}${label}`, LIST_PADDING, 0));
       }
       if (start > 0 || end < this.filtered.length) {
@@ -166,7 +176,12 @@ export class SingleSelectPicker<T extends string> extends Container implements F
     const shown = query
       ? `${this.filtered.length}/${this.choices.length} matching choices`
       : `${this.choices.length} choices`;
-    const legend = `${this.theme.fg("accent", "●")} ${this.theme.fg("dim", "current")}`;
+    const legend = [
+      `${this.theme.fg("accent", "●")} ${this.theme.fg("dim", "current")}`,
+      this.options.legend,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join("  ");
     this.footer.setText(
       `${this.theme.fg("dim", shown)}  ${legend}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", query ? "clear search" : (this.options.cancelLabel ?? "back"))}`,
     );

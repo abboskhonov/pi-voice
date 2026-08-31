@@ -17,22 +17,21 @@ import {
 import { getAvailableMicrophones, testMicrophonePermission } from "./audio.js";
 import { displayLanguage, getCatalogModel } from "./catalog.js";
 import { chineseOutputSummary, isChineseLanguage } from "./chinese.js";
+import { createModelActivation } from "./model-activation.js";
 import {
   CatalogModelPicker,
+  createTranscriptionLanguagePicker,
   LanguagePicker,
-  TranscriptionLanguagePicker,
   transcriptionLanguageSummary,
   type CatalogModelPickerResult,
   type LanguageSelection,
 } from "./model-picker.js";
-import { downloadCatalogModel, findCachedCatalogModel } from "./models.js";
 import {
   settingsForModel,
   writeSettings,
   type ChineseOutput,
   type MicrophoneSetting,
   type TranscribeSettings,
-  type TranscriptionLanguage,
 } from "./settings.js";
 import { displayShortcut } from "./shortcut-core.js";
 import { createShortcutPicker } from "./shortcuts.js";
@@ -164,7 +163,7 @@ class ModelSettingsSubmenu extends Container implements Focusable {
   private _focused = false;
   private selectedDuringSession = false;
   private disposed = false;
-  private commitQueue: Promise<void> = Promise.resolve();
+  private readonly activation: ReturnType<typeof createModelActivation>;
 
   get focused(): boolean {
     return this._focused;
@@ -185,6 +184,21 @@ class ModelSettingsSubmenu extends Container implements Focusable {
     private readonly done: (value?: string) => void,
   ) {
     super();
+    this.activation = createModelActivation({
+      buildSettings: (model, path) =>
+        settingsForModel(model.id, path, {
+          shortcut: this.configured.shortcut,
+          preferredLanguages: this.configured.preferredLanguages,
+          transcriptionLanguage: this.configured.transcriptionLanguage,
+          chineseOutput: this.configured.chineseOutput,
+          microphone: this.configured.microphone,
+        }),
+      onCommitted: (settings) => {
+        Object.assign(this.configured, settings);
+        this.selectedDuringSession = true;
+        this.onUpdated();
+      },
+    });
     this.showModels();
   }
 
@@ -197,15 +211,6 @@ class ModelSettingsSubmenu extends Container implements Focusable {
     this.tui.requestRender();
   }
 
-  private enqueueCommit(commit: () => Promise<void>): Promise<void> {
-    const result = this.commitQueue.then(commit);
-    this.commitQueue = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  }
-
   private showModels(): void {
     const picker = new CatalogModelPicker(
       this.tui,
@@ -214,47 +219,11 @@ class ModelSettingsSubmenu extends Container implements Focusable {
       this.configured.preferredLanguages,
       this.configured.model.id,
       (result) => void this.handleModelResult(result),
-      async (model, { cached, signal, onProgress }) => {
-        let path: string;
-        if (cached) {
-          const stillCached = findCachedCatalogModel(model);
-          if (!stillCached) {
-            throw new Error(
-              "the downloaded file is missing; select the model again to re-download it",
-            );
-          }
-          path = stillCached.path;
-        } else {
-          path = await downloadCatalogModel(model, { signal, onProgress });
-          // A completed download always commits: the bytes are verified and
-          // cached, so a cancel racing the final write must not discard the
-          // selection.
-        }
-
-        await this.enqueueCommit(async () => {
-          signal.throwIfAborted();
-          const updated = settingsForModel(model.id, path, {
-            shortcut: this.configured.shortcut,
-            preferredLanguages: this.configured.preferredLanguages,
-            transcriptionLanguage: this.configured.transcriptionLanguage,
-            chineseOutput: this.configured.chineseOutput,
-            microphone: this.configured.microphone,
-          });
-          try {
-            await writeSettings(updated);
-          } catch (error) {
-            throw new Error(
-              `Could not save settings: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-          Object.assign(this.configured, updated);
-          this.selectedDuringSession = true;
-          this.onUpdated();
-        });
-        return { path };
+      this.activation.activate,
+      {
+        postActivation: "stay",
+        activatedInFlow: this.selectedDuringSession,
       },
-      false,
-      this.selectedDuringSession,
     );
     this.setActive(picker);
   }
@@ -262,7 +231,7 @@ class ModelSettingsSubmenu extends Container implements Focusable {
   private async handleModelResult(
     result: CatalogModelPickerResult | undefined,
   ): Promise<void> {
-    await this.commitQueue;
+    await this.activation.waitForCommits();
     if (this.disposed) return;
     if (result?.type === "change-languages") {
       this.showLanguages();
@@ -397,6 +366,35 @@ export async function showSettingsMenu(
       tui.requestRender();
     };
 
+    // Shared submenu epilogue: an unchanged value just closes; a changed one
+    // is saved, reflected in the list, and then closes.
+    const commitSetting = (
+      close: (value?: string) => void,
+      options: {
+        summary: string;
+        unchanged: boolean;
+        patch: Partial<TranscribeSettings>;
+        message?: string;
+        onSaved?: () => void;
+      },
+    ): void => {
+      if (options.unchanged) {
+        close(options.summary);
+        return;
+      }
+      void saveUpdatedSettings(
+        ctx,
+        configured,
+        { ...configured, ...options.patch },
+        options.message,
+      ).then((saved) => {
+        if (!saved) return;
+        options.onSaved?.();
+        updateDisplayedValues();
+        close(options.summary);
+      });
+    };
+
     const model = getCatalogModel(configured.model.id)!;
     const chineseChoices: SingleSelectChoice<ChineseOutput>[] = [
       {
@@ -416,6 +414,40 @@ export async function showSettingsMenu(
       },
     ];
 
+    // Character-style conversion only matters when Chinese can appear in
+    // transcripts; hide the setting otherwise.
+    const showChineseOutput =
+      isChineseLanguage(configured.transcriptionLanguage) ||
+      configured.preferredLanguages.some(isChineseLanguage);
+    const chineseOutputItem: SettingItem = {
+      id: "chinese-output",
+      label: "Chinese output",
+      currentValue: chineseOutputSummary(configured.chineseOutput),
+      description: "Character style used for Chinese transcripts",
+      submenu: (_currentValue, close) =>
+        new SingleSelectPicker(
+          tui,
+          theme,
+          keybindings,
+          chineseChoices,
+          configured.chineseOutput,
+          { title: "Choose Chinese output", cancelLabel: "back" },
+          (chineseOutput) => {
+            if (!chineseOutput) {
+              close();
+              return;
+            }
+            const summary = chineseOutputSummary(chineseOutput);
+            commitSetting(close, {
+              summary,
+              unchanged: chineseOutput === configured.chineseOutput,
+              patch: { chineseOutput },
+              message: `Chinese output saved as ${summary}`,
+            });
+          },
+        ),
+    };
+
     const items: SettingItem[] = [
       {
         id: "preferred-languages",
@@ -434,22 +466,13 @@ export async function showSettingsMenu(
                 close();
                 return;
               }
-              const preferredLanguages = selection.languages;
-              if (
-                preferredLanguages.join("\0") === configured.preferredLanguages.join("\0")
-              ) {
-                close(preferredLanguagesSummary(preferredLanguages));
-                return;
-              }
-              void saveUpdatedSettings(
-                ctx,
-                configured,
-                { ...configured, preferredLanguages },
-                "Preferred languages saved",
-              ).then((saved) => {
-                if (!saved) return;
-                updateDisplayedValues();
-                close(preferredLanguagesSummary(preferredLanguages));
+              commitSetting(close, {
+                summary: preferredLanguagesSummary(selection.languages),
+                unchanged:
+                  selection.languages.join("\0") ===
+                  configured.preferredLanguages.join("\0"),
+                patch: { preferredLanguages: selection.languages },
+                message: "Preferred languages saved",
               });
             },
             false,
@@ -478,7 +501,7 @@ export async function showSettingsMenu(
         description: "Language expected in recordings, or automatic detection when supported",
         submenu: (_currentValue, close) => {
           const currentModel = getCatalogModel(configured.model.id)!;
-          return new TranscriptionLanguagePicker(
+          return createTranscriptionLanguagePicker(
             tui,
             theme,
             keybindings,
@@ -490,67 +513,21 @@ export async function showSettingsMenu(
                 close();
                 return;
               }
-              if (transcriptionLanguage === configured.transcriptionLanguage) {
-                close(transcriptionLanguageSummary(transcriptionLanguage, currentModel));
-                return;
-              }
               const summary = transcriptionLanguageSummary(
                 transcriptionLanguage,
                 currentModel,
               );
-              void saveUpdatedSettings(
-                ctx,
-                configured,
-                { ...configured, transcriptionLanguage },
-                `Transcription language saved as ${summary}`,
-              ).then((saved) => {
-                if (!saved) return;
-                updateDisplayedValues();
-                close(summary);
+              commitSetting(close, {
+                summary,
+                unchanged: transcriptionLanguage === configured.transcriptionLanguage,
+                patch: { transcriptionLanguage },
+                message: `Transcription language saved as ${summary}`,
               });
             },
           );
         },
       },
-      {
-        id: "chinese-output",
-        label: "Chinese output",
-        currentValue: chineseOutputSummary(configured.chineseOutput),
-        description: isChineseLanguage(configured.transcriptionLanguage) ||
-          configured.preferredLanguages.some(isChineseLanguage)
-          ? "Character style used for Chinese transcripts"
-          : "Applied whenever the selected model returns Chinese text",
-        submenu: (_currentValue, close) =>
-          new SingleSelectPicker(
-            tui,
-            theme,
-            keybindings,
-            chineseChoices,
-            configured.chineseOutput,
-            { title: "Choose Chinese output", cancelLabel: "back" },
-            (chineseOutput) => {
-              if (!chineseOutput) {
-                close();
-                return;
-              }
-              const summary = chineseOutputSummary(chineseOutput);
-              if (chineseOutput === configured.chineseOutput) {
-                close(summary);
-                return;
-              }
-              void saveUpdatedSettings(
-                ctx,
-                configured,
-                { ...configured, chineseOutput },
-                `Chinese output saved as ${summary}`,
-              ).then((saved) => {
-                if (!saved) return;
-                updateDisplayedValues();
-                close(summary);
-              });
-            },
-          ),
-      },
+      ...(showChineseOutput ? [chineseOutputItem] : []),
       {
         id: "microphone",
         label: "Microphone",
@@ -580,19 +557,11 @@ export async function showSettingsMenu(
               const microphone = byValue.get(value);
               if (!microphone) return;
               const summary = microphoneSummary(microphone);
-              if (microphonesEqual(microphone, configured.microphone)) {
-                close(summary);
-                return;
-              }
-              void saveUpdatedSettings(
-                ctx,
-                configured,
-                { ...configured, microphone },
-                `Microphone saved as ${summary}`,
-              ).then((saved) => {
-                if (!saved) return;
-                updateDisplayedValues();
-                close(summary);
+              commitSetting(close, {
+                summary,
+                unchanged: microphonesEqual(microphone, configured.microphone),
+                patch: { microphone },
+                message: `Microphone saved as ${summary}`,
               });
             },
           );
@@ -614,23 +583,17 @@ export async function showSettingsMenu(
                 close();
                 return;
               }
-              if (shortcut === configured.shortcut) {
-                close(displayShortcut(shortcut));
-                return;
-              }
-              void saveUpdatedSettings(
-                ctx,
-                configured,
-                { ...configured, shortcut },
-              ).then((saved) => {
-                if (!saved) return;
-                reload = shortcut !== registeredShortcut;
-                updateDisplayedValues();
-                ctx.ui.notify(
-                  `Shortcut saved as ${displayShortcut(shortcut)}. It will apply when settings close; other open Pi processes must be reloaded separately.`,
-                  "info",
-                );
-                close(displayShortcut(shortcut));
+              commitSetting(close, {
+                summary: displayShortcut(shortcut),
+                unchanged: shortcut === configured.shortcut,
+                patch: { shortcut },
+                onSaved: () => {
+                  reload = shortcut !== registeredShortcut;
+                  ctx.ui.notify(
+                    `Shortcut saved as ${displayShortcut(shortcut)}. It will apply when settings close; other open Pi processes must be reloaded separately.`,
+                    "info",
+                  );
+                },
               });
             },
           ),
