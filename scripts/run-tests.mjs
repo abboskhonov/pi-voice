@@ -29,6 +29,7 @@ try {
     "--test",
     join(outputDirectory, "test", "async-limiter.test.js"),
     join(outputDirectory, "test", "eager-imports.test.js"),
+    join(outputDirectory, "test", "models.test.js"),
     join(outputDirectory, "test", "pcm-chunker.test.js"),
     join(outputDirectory, "test", "transcription-service.test.js"),
   ]);
