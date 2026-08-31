@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 
@@ -25,17 +25,12 @@ try {
     "--outDir",
     outputDirectory,
   ]);
-  await run(process.execPath, [
-    "--test",
-    join(outputDirectory, "test", "async-limiter.test.js"),
-    join(outputDirectory, "test", "catalog.test.js"),
-    join(outputDirectory, "test", "eager-imports.test.js"),
-    join(outputDirectory, "test", "model-picker.test.js"),
-    join(outputDirectory, "test", "models.test.js"),
-    join(outputDirectory, "test", "pcm-chunker.test.js"),
-    join(outputDirectory, "test", "transcription-service.test.js"),
-    join(outputDirectory, "test", "ui-components.test.js"),
-  ]);
+  const testDirectory = join(outputDirectory, "test");
+  const testFiles = (await readdir(testDirectory))
+    .filter((name) => name.endsWith(".test.js"))
+    .sort()
+    .map((name) => join(testDirectory, name));
+  await run(process.execPath, ["--test", ...testFiles]);
 } finally {
   await rm(outputDirectory, { recursive: true, force: true });
 }

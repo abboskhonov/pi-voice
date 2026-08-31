@@ -66,7 +66,7 @@ export function modelMatchesLanguage(model: CatalogModel, language: string): boo
   return model.languages.some((supported) => canonicalLanguage(supported) === wanted);
 }
 
-export function preferredLanguageMatchCount(
+function preferredLanguageMatchCount(
   model: CatalogModel,
   preferredLanguages: readonly string[],
 ): number {

@@ -74,6 +74,14 @@ export function createPiTranscribeRuntime(
     return (visualizerModulePromise ??= import("./visualizer.js"));
   }
 
+  async function reportCaptureError(ctx: ExtensionContext, error: unknown): Promise<void> {
+    ctx.ui.notify(captureErrorMessage(error), "error");
+    if (!isMicrophoneUnavailableError(error)) {
+      const { offerMacOSPermissionHelp } = await import("./settings-menu.js");
+      await offerMacOSPermissionHelp(pi, ctx);
+    }
+  }
+
   function rememberSettings(configured: TranscribeSettings): void {
     settings = configured;
     settingsLoaded = true;
@@ -225,11 +233,7 @@ export function createPiTranscribeRuntime(
         pcm = audio.pcm;
       } catch (error) {
         active.reservation.cancel();
-        ctx.ui.notify(captureErrorMessage(error), "error");
-        if (!isMicrophoneUnavailableError(error)) {
-          const { offerMacOSPermissionHelp } = await import("./settings-menu.js");
-          await offerMacOSPermissionHelp(pi, ctx);
-        }
+        await reportCaptureError(ctx, error);
         return;
       }
 
@@ -312,11 +316,7 @@ export function createPiTranscribeRuntime(
     } catch (error) {
       reservation.cancel();
       clearCancelListener();
-      ctx.ui.notify(captureErrorMessage(error), "error");
-      if (!isMicrophoneUnavailableError(error)) {
-        const { offerMacOSPermissionHelp } = await import("./settings-menu.js");
-        await offerMacOSPermissionHelp(pi, ctx);
-      }
+      await reportCaptureError(ctx, error);
       return;
     }
     const active: ActiveRecording = { capture, reservation, chunker, meter };

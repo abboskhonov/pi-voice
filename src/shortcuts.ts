@@ -20,8 +20,6 @@ import {
 } from "./shortcut-core.js";
 import { panelBorder } from "./ui-components.js";
 
-export { DEFAULT_SHORTCUT, displayShortcut, normalizeShortcut } from "./shortcut-core.js";
-
 type UiTheme = ExtensionContext["ui"]["theme"];
 type Conflict = { description: string };
 type Phase =

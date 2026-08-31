@@ -41,6 +41,7 @@ import {
   LIST_PADDING,
   PANEL_PADDING,
   panelBorder,
+  selectedWindow,
   SingleSelectPicker,
   type SingleSelectChoice,
 } from "./ui-components.js";
@@ -81,14 +82,6 @@ function transcriptionLanguageName(
     (supported) => canonicalLanguage(supported) === base,
   );
   return displayLanguage(variants.length > 1 ? language : base);
-}
-
-function selectedWindow<T>(items: readonly T[], selected: number, maximum: number): [number, number] {
-  const start = Math.max(
-    0,
-    Math.min(selected - Math.floor(maximum / 2), items.length - maximum),
-  );
-  return [start, Math.min(start + maximum, items.length)];
 }
 
 export type LanguageSelection = {

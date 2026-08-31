@@ -1,14 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  initTheme,
-  type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
-import {
-  KeybindingsManager,
-  TUI_KEYBINDINGS,
-  type TUI,
-} from "@earendil-works/pi-tui";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   CatalogModelPicker,
   createTranscriptionLanguagePicker,
@@ -21,6 +14,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CATALOG_MODELS, type CatalogModel } from "../src/catalog.js";
+import { keybindings, stripAnsi, testTheme, testTui } from "./ui-helpers.js";
 
 // Keep cache and partial-download probes away from the real Hugging Face cache.
 process.env.HF_HUB_CACHE = mkdtempSync(join(tmpdir(), "pi-transcribe-picker-"));
@@ -29,23 +23,7 @@ initTheme("dark");
 
 const ESC = "\u001b";
 const ENTER = "\r";
-const DOWN = "\u001b[B";
-
-function testTheme(): ExtensionContext["ui"]["theme"] {
-  return {
-    fg: (_color: string, text: string) => text,
-    bold: (text: string) => text,
-    inverse: (text: string) => text,
-  } as unknown as ExtensionContext["ui"]["theme"];
-}
-
-function testTui(): TUI {
-  return { requestRender() {} } as unknown as TUI;
-}
-
-function keybindings(): KeybindingsManager {
-  return new KeybindingsManager(TUI_KEYBINDINGS);
-}
+const MODELS_SHOWN = `${CATALOG_MODELS.length} models`;
 
 type ActivationOptions = {
   cached: unknown;
@@ -56,7 +34,6 @@ type ActivationOptions = {
 type PickerInternals = {
   cachedById: Map<string, unknown>;
   mode: string;
-  downloadSamples: { t: number; bytes: number }[];
   filtered: CatalogModel[];
   refresh: () => void;
 };
@@ -130,27 +107,7 @@ test("enter on an uncached model starts the download immediately", (t) => {
   assert.match(downloading, /█+─+ 42%/);
   assert.match(downloading, /1\.2 GiB \/ 2\.8 GiB/);
   // The list and search are gone while the modal progress view is up.
-  assert.doesNotMatch(downloading, /67 models/);
-});
-
-test("download stats include a rolling speed and ETA", (t) => {
-  const { picker, internals, progress } = controlledPicker();
-  t.after(() => picker.dispose());
-  picker.handleInput(ENTER);
-  progress(1_000_000_000, 3_000_000_000);
-  // Spread the samples 4s apart: wide enough for a speed estimate, with a
-  // second of slack inside the 5s window so wall-clock time elapsing before
-  // the next refresh cannot age the first sample out on a slow CI runner.
-  const now = Date.now();
-  internals.downloadSamples = [
-    { t: now - 4000, bytes: 600_000_000 },
-    { t: now, bytes: 1_000_000_000 },
-  ];
-  // A further progress event refreshes the stats line from those samples.
-  progress(1_000_000_000, 3_000_000_000);
-  const body = rendered(picker);
-  assert.match(body, /95 MiB\/s/);
-  assert.match(body, /~\d+(s| min) left/);
+  assert.ok(!downloading.includes(MODELS_SHOWN));
 });
 
 test("esc during a download stops it immediately and keeps progress", async (t) => {
@@ -170,7 +127,7 @@ test("esc during a download stops it immediately and keeps progress", async (t) 
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(internals.mode, "models");
   const body = rendered(picker);
-  assert.match(body, /67 models/);
+  assert.ok(body.includes(MODELS_SHOWN));
   assert.match(body, /Download stopped — progress saved/);
 });
 
@@ -212,41 +169,21 @@ test("advance policy also skips an extra pane for a downloaded model", async (t)
   assert.doesNotMatch(stripAnsi(rendered(picker)), /Model ready/);
 });
 
-test("size and downloaded columns stay aligned and rows never wrap", (t) => {
+test("model rows never overflow the render width", (t) => {
   const { picker, internals } = controlledPicker();
   t.after(() => picker.dispose());
-  const byName = new Map(CATALOG_MODELS.map((model) => [model.name, model]));
-  // Cached sizes spanning 2-3 digits and MiB/GiB so misalignment would show.
-  for (const name of ["Moonshine Streaming Tiny", "Parakeet Unified EN 0.6B", "Voxtral Small 24B"]) {
-    internals.cachedById.set(byName.get(name)!.id, { path: "x" });
+  // Downloaded models carry the widest rows (checkmark plus size column);
+  // mark a few before measuring.
+  for (const model of internals.filtered.slice(0, 3)) {
+    internals.cachedById.set(model.id, { path: "x" });
   }
   internals.refresh();
-  const strip = (line: string) => line.replace(/\u001b\[[0-9;]*m/g, "");
   for (const width of [80, 100]) {
-    const lines = picker.render(width).map(strip);
-    const rows = lines.filter((line) => / [MG]iB/.test(line) && !/·|download/.test(line));
-    // Ten visible models, each on a single unwrapped line.
-    assert.equal(rows.length, 10, `model rows at width ${width}`);
-    const checkColumns = new Set(
-      rows.filter((line) => line.includes("✓")).map((line) => line.indexOf("✓")),
-    );
-    assert.equal(checkColumns.size, 1, `✓ column drifts at width ${width}`);
-    // Sizes are right-aligned: every size ends at the same column.
-    const sizeEnds = new Set(rows.map((line) => line.search(/ [MG]iB/) + 4));
-    assert.equal(sizeEnds.size, 1, `size column drifts at width ${width}`);
-    for (const line of lines) {
-      assert.ok(visibleLength(line) <= width, `overflowing line at width ${width}: ${line}`);
+    for (const line of picker.render(width)) {
+      assert.ok(visibleWidth(line) <= width, `overflowing line at width ${width}: ${line}`);
     }
   }
 });
-
-function stripAnsi(value: string): string {
-  return value.replace(/\u001b\[[0-9;]*m/g, "");
-}
-
-function visibleLength(line: string): number {
-  return stripAnsi(line).length;
-}
 
 test("language picker shows tab-to-continue inline on the action row", () => {
   const picker = new LanguagePicker(

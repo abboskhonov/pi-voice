@@ -31,12 +31,16 @@ export type SingleSelectChoice<T extends string> = {
   description?: string;
 };
 
-function selectedWindow(length: number, selected: number, maximum: number): [number, number] {
+export function selectedWindow<T>(
+  items: readonly T[],
+  selected: number,
+  maximum: number,
+): [number, number] {
   const start = Math.max(
     0,
-    Math.min(selected - Math.floor(maximum / 2), length - maximum),
+    Math.min(selected - Math.floor(maximum / 2), items.length - maximum),
   );
-  return [start, Math.min(start + maximum, length)];
+  return [start, Math.min(start + maximum, items.length)];
 }
 
 /** Pi-native single-choice picker with optional fuzzy search and a current-value marker. */
@@ -139,7 +143,7 @@ export class SingleSelectPicker<T extends string> extends Container implements F
     } else {
       const maximum = this.options.maximumVisible ?? 10;
       const [start, end] = selectedWindow(
-        this.filtered.length,
+        this.filtered,
         this.selectedIndex,
         maximum,
       );
