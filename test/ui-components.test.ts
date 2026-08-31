@@ -85,3 +85,36 @@ test("single-select picker clears search before going back and respects width", 
   assert.equal(closes, 1);
   assert.ok(picker.render(40).every((line) => visibleWidth(line) <= 40));
 });
+
+test("single-select picker shrinks its window to fit a 24-row terminal", () => {
+  const choices = Array.from({ length: 30 }, (_, index) => ({
+    value: `choice-${index}`,
+    label: `Choice ${index}`,
+    description: `Description for choice ${index}`,
+  }));
+  const build = (rows?: number) =>
+    new SingleSelectPicker(
+      testTui(rows),
+      testTheme(),
+      keybindings(),
+      choices,
+      "choice-0",
+      { title: "Choose one", searchable: true },
+      () => {},
+    );
+  const listRows = (lines: string[]) =>
+    lines.filter((line) => line.includes("Choice ")).length;
+
+  const short = build(24).render(80);
+  // 24 terminal rows minus the two host footer lines.
+  assert.ok(short.length <= 22, `pane is ${short.length} rows`);
+  assert.ok(listRows(short) < 10);
+  // The chrome survives the shrink: title and key hints stay on screen.
+  assert.match(short.join("\n"), /Choose one/);
+  assert.match(short.join("\n"), /navigate/);
+
+  // A tall terminal keeps the default ten-row window.
+  assert.equal(listRows(build(40).render(80)), 10);
+  // Without terminal size information the cap also applies unchanged.
+  assert.equal(listRows(build().render(80)), 10);
+});

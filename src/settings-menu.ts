@@ -2,6 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { getAvailableMicrophones, testMicrophonePermission } from "./audio.js";
 import { displayLanguage, getCatalogModel } from "./catalog.js";
 import { chineseOutputSummary, isChineseLanguage } from "./chinese.js";
@@ -29,6 +30,8 @@ import {
 const MACOS_MICROPHONE_SETTINGS_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 const SETTINGS_LABEL_WIDTH = 25;
+// Text padding (2), cursor gutter (2), label column, and its gap (2).
+const SETTINGS_ROW_OVERHEAD = SETTINGS_LABEL_WIDTH + 6;
 
 type MicrophonePermission = Awaited<ReturnType<typeof testMicrophonePermission>>;
 type SettingsAction =
@@ -218,11 +221,17 @@ async function showSettingsHome(
       {
         title: "pi-transcribe settings",
         cancelLabel: "close",
-        renderLabel: (choice, active) => {
+        renderLabel: (choice, active, width) => {
           const row = rows.get(choice.value);
           const labelText = padToWidth(choice.label, SETTINGS_LABEL_WIDTH);
           const label = active ? theme.fg("accent", labelText) : labelText;
-          const summary = row?.summary ?? "";
+          // Long summaries (language lists, microphone names) truncate so
+          // they never wrap the row and break the column layout.
+          const summary = truncateToWidth(
+            row?.summary ?? "",
+            Math.max(12, width - SETTINGS_ROW_OVERHEAD),
+            "…",
+          );
           const value = row?.alert
             ? theme.fg("error", summary)
             : theme.fg("dim", summary);

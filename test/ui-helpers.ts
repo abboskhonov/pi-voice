@@ -14,8 +14,11 @@ export function testTheme(): ExtensionContext["ui"]["theme"] {
   } as unknown as ExtensionContext["ui"]["theme"];
 }
 
-export function testTui(): TUI {
-  return { requestRender() {} } as unknown as TUI;
+export function testTui(rows?: number): TUI {
+  return {
+    requestRender() {},
+    ...(rows === undefined ? {} : { terminal: { rows, columns: 80 } }),
+  } as unknown as TUI;
 }
 
 export function keybindings(): KeybindingsManager {

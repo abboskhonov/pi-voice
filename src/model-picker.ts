@@ -39,11 +39,14 @@ import {
 import type { TranscriptionLanguage } from "./settings.js";
 import {
   LIST_PADDING,
+  MIN_VISIBLE_ROWS,
   PANEL_PADDING,
   padToWidth,
   panelBorder,
+  paneRowBudget,
   selectedWindow,
   SingleSelectPicker,
+  windowSizeForBudget,
   type SingleSelectChoice,
 } from "./ui-components.js";
 
@@ -94,6 +97,8 @@ export class LanguagePicker extends Container implements Focusable {
   private ordered: string[] = [];
   private filtered: string[] = [];
   private selectedIndex = 0;
+  /** Scroll-window rows (rule included); shrinks to fit short terminals. */
+  private windowRows = MAX_VISIBLE_LANGUAGES + 1;
   private _focused = false;
 
   get focused(): boolean {
@@ -196,8 +201,9 @@ export class LanguagePicker extends Container implements Focusable {
         boundary >= 0 && this.selectedIndex >= boundary
           ? this.selectedIndex + 1
           : this.selectedIndex;
-      // +1 so the window holds the same line count with or without the rule.
-      const [start, end] = selectedWindow(rows, cursorRow, MAX_VISIBLE_LANGUAGES + 1);
+      // Sized +1 so the window holds the same line count with or without the
+      // rule row.
+      const [start, end] = selectedWindow(rows, cursorRow, this.windowRows);
       for (let index = start; index < end; index += 1) {
         const language = rows[index]!;
         if (language === null) {
@@ -254,6 +260,28 @@ export class LanguagePicker extends Container implements Focusable {
     // group; on deselect stay put — trailing the language to its new spot far
     // down the list is disorienting.
     this.refresh(adding ? language : undefined);
+  }
+
+  // The pane replaces the host editor and cannot scroll: when the terminal is
+  // short, shrink the window so the title, Continue row, and footer stay on
+  // screen.
+  override render(width: number): string[] {
+    const budget = paneRowBudget(this.tui);
+    if (budget !== undefined) {
+      const chrome = super.render(width).length - this.list.render(width).length;
+      // The spacer and Continue row live inside the list; the scroll window
+      // gets the rest, still +1 sized for the rule row.
+      const rows = windowSizeForBudget(
+        budget - chrome - 2,
+        MAX_VISIBLE_LANGUAGES + 1,
+        MIN_VISIBLE_ROWS + 1,
+      );
+      if (rows !== this.windowRows) {
+        this.windowRows = rows;
+        this.refresh();
+      }
+    }
+    return super.render(width);
   }
 
   handleInput(data: string): void {
@@ -339,7 +367,6 @@ export class CatalogModelPicker extends Container implements Focusable {
   private readonly searchBox = new Box(LIST_PADDING, 0);
   private readonly body = new Container();
   private readonly preferredLine = new Text("", TEXT_PADDING, 0);
-  private readonly currentLine = new Text("", TEXT_PADDING, 0);
   private readonly list = new Container();
   private readonly detail = new Text("", TEXT_PADDING, 0);
   private readonly footer = new Text("", TEXT_PADDING, 0);
@@ -351,6 +378,8 @@ export class CatalogModelPicker extends Container implements Focusable {
   private readonly modelSizeWidth: number;
   /** Width of the last render; row columns are laid out against it. */
   private renderWidth = 80;
+  /** Rows the model window may use; shrinks to fit short terminals. */
+  private visibleModels = MAX_VISIBLE_MODELS;
   private filtered: CatalogModel[] = [];
   private selectedIndex = 0;
   /** Last selection whose activation finished; what settings actually hold. */
@@ -421,7 +450,6 @@ export class CatalogModelPicker extends Container implements Focusable {
     this.addChild(new Spacer(1));
     this.addChild(new Text(theme.fg("accent", theme.bold("Choose a transcription model")), TEXT_PADDING, 0));
     this.addChild(this.preferredLine);
-    this.addChild(this.currentLine);
     this.addChild(this.body);
     this.addChild(new Spacer(1));
     this.addChild(panelBorder(theme));
@@ -449,12 +477,37 @@ export class CatalogModelPicker extends Container implements Focusable {
 
   // Column widths depend on the terminal: relay out when the width changes so
   // rows truncate their name column instead of wrapping onto a second line.
+  // Short terminals also shrink the list window so the title, Languages line,
+  // detail, and footer stay on screen; the downloading panel is short enough
+  // to be exempt.
   override render(width: number): string[] {
     if (width !== this.renderWidth) {
       this.renderWidth = width;
       this.refresh();
     }
+    const budget = this.mode === "models" ? paneRowBudget(this.tui) : undefined;
+    if (budget !== undefined) {
+      const total = super.render(width).length;
+      const detailLines = this.detail.render(width).length;
+      const chrome =
+        total - this.list.render(width).length - detailLines + this.detailReserve(width);
+      const visible = windowSizeForBudget(budget - chrome, MAX_VISIBLE_MODELS);
+      if (visible !== this.visibleModels) {
+        this.visibleModels = visible;
+        this.refresh();
+      }
+    }
     return super.render(width);
+  }
+
+  // The description is truncated to one line, so only transient feedback can
+  // change the detail height; reserving for it keeps the window steady.
+  private detailReserve(width: number): number {
+    const feedbackLines = this.feedback
+      ? new Text(this.feedback.text, TEXT_PADDING, 0).render(width).length
+      : 0;
+    // One description line plus the features line.
+    return 2 + feedbackLines;
   }
 
   private refresh(): void {
@@ -468,12 +521,6 @@ export class CatalogModelPicker extends Container implements Focusable {
       "…",
     );
     this.preferredLine.setText(`${this.theme.fg("muted", languagesText)}${preferredAction}`);
-    // States what settings hold right now; the ● marker may run ahead of it
-    // while a selection is still activating.
-    const committed = this.models.find((model) => model.id === this.committedModelId);
-    this.currentLine.setText(
-      `${this.theme.fg("muted", "Current: ")}${committed ? committed.name : this.theme.fg("muted", "none yet")}`,
-    );
     this.search.focused = this._focused && this.mode === "models";
 
     if (this.mode === "downloading") {
@@ -539,7 +586,7 @@ export class CatalogModelPicker extends Container implements Focusable {
       this.list.addChild(new Text(this.theme.fg("dim", "  No matching models"), LIST_PADDING, 0));
       this.detail.setText("");
     } else {
-      const [start, end] = selectedWindow(this.filtered, this.selectedIndex, MAX_VISIBLE_MODELS);
+      const [start, end] = selectedWindow(this.filtered, this.selectedIndex, this.visibleModels);
       const languagesWidth = visibleWidth(this.languageColumns.join(" "));
       // Everything in a row except the name: Text padding, "→ ● " gutter,
       // column gaps, the "✓ " cell, the size column, and the ★ column.
@@ -574,16 +621,6 @@ export class CatalogModelPicker extends Container implements Focusable {
           ),
         );
       }
-      if (start > 0 || end < this.filtered.length) {
-        this.list.addChild(
-          new Text(
-            this.theme.fg("dim", `  (${this.selectedIndex + 1}/${this.filtered.length})`),
-            LIST_PADDING,
-            0,
-          ),
-        );
-      }
-
       const selected = this.filtered[this.selectedIndex]!;
       const canonicalLanguages = [...new Set(selected.languages.map(canonicalLanguage))];
       const features = [
@@ -595,14 +632,25 @@ export class CatalogModelPicker extends Container implements Focusable {
       const feedback = this.feedback
         ? `\n${this.theme.fg(this.feedback.type, this.feedback.text)}`
         : "";
+      // One line: the features line below already carries the capabilities a
+      // long description would wrap for.
+      const description = truncateToWidth(
+        selected.description,
+        Math.max(24, this.renderWidth - TEXT_PADDING * 2),
+        "…",
+      );
       this.detail.setText(
-        `${selected.description}\n${this.theme.fg("dim", features.join(" · "))}${feedback}`,
+        `${description}\n${this.theme.fg("dim", features.join(" · "))}${feedback}`,
       );
     }
 
+    // The scroll position lives in this count, so the list never spends a
+    // row on an indicator.
     const shown = query
-      ? `${this.filtered.length}/${this.models.length} matching models`
-      : `${this.models.length} models`;
+      ? this.filtered.length === 0
+        ? `0/${this.models.length} matching models`
+        : `${this.selectedIndex + 1}/${this.filtered.length} matching models`
+      : `${this.selectedIndex + 1}/${this.models.length} models`;
     const statusLegend = [
       displayedId
         ? `${this.theme.fg("accent", "●")} ${this.theme.fg("dim", "current")}`
@@ -953,20 +1001,16 @@ export function createTranscriptionLanguagePicker(
     {
       title: "Choose transcription language",
       subtitle: model.capabilities.languageDetection
-        ? "Choose the language expected in recordings, or let the model detect it automatically."
-        : "Choose the language expected in recordings.",
+        ? "Language expected in recordings, or automatic detection."
+        : "Language expected in recordings.",
       searchable: true,
       maximumVisible: MAX_VISIBLE_LANGUAGES,
       cancelLabel: "back",
-      legend: choices.some((choice) => isPreferred(choice.value))
-        ? `${theme.fg("accent", "★")} ${theme.fg("dim", "preferred language")}`
-        : undefined,
       renderLabel: (choice, active) => {
         const nameText = padToWidth(choice.label, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
         const name = active ? theme.fg("accent", nameText) : nameText;
         const code = choice.value === "auto" ? "" : theme.fg("dim", choice.value);
-        const yours = isPreferred(choice.value) ? `  ${theme.fg("accent", "★")}` : "";
-        return `${name}  ${code}${yours}`;
+        return `${name}  ${code}`;
       },
     },
     done,

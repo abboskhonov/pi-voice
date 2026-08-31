@@ -140,7 +140,7 @@ test("a finished download reports success and marks the model downloaded", async
   assert.equal(internals.mode, "models");
   const body = rendered(picker);
   assert.match(body, /✓ Downloaded and selected /);
-  assert.match(body, /Current: /);
+  assert.match(body, /● current/);
   assert.ok(internals.cachedById.size > 0);
 });
 
@@ -200,7 +200,7 @@ test("language picker shows tab-to-continue inline on the action row", () => {
   assert.doesNotMatch(actionLine, /move|select|skip for now/);
 });
 
-test("transcription language picker keeps auto detect, codes, and preferred stars", () => {
+test("transcription language picker keeps auto detect and language codes", () => {
   const model = CATALOG_MODELS.find(
     (candidate) => candidate.capabilities.languageDetection && candidate.languages.length > 5,
   )!;
@@ -219,8 +219,9 @@ test("transcription language picker keeps auto detect, codes, and preferred star
   const lines = picker.render(80);
   assert.ok(lines.some((line) => line.includes("→ ● Auto detect")));
   // Multiple English variants keep their regional labels and codes.
-  assert.ok(lines.some((line) => /English\s+en-US  ★/.test(line)));
-  assert.ok(lines.some((line) => line.includes("★ preferred language")));
+  assert.ok(lines.some((line) => /English\s+en-US/.test(line)));
+  // Preferred languages still sort first but carry no star marker.
+  assert.ok(!lines.some((line) => line.includes("★")));
   picker.handleInput(ENTER);
   assert.equal(chosen, "auto");
 });
@@ -249,4 +250,82 @@ test("only an exact-hash partial switches the footer to resume", (t) => {
   t.after(() => rmSync(partialPath, { force: true }));
   internals.refresh();
   assert.match(rendered(picker), /resume download/);
+});
+
+const DOWN = `${ESC}[B`;
+
+test("model picker fits an 80x24 terminal at every scroll position", (t) => {
+  const picker = new CatalogModelPicker(
+    testTui(24),
+    testTheme(),
+    keybindings(),
+    ["en"],
+    undefined,
+    () => {},
+    () => new Promise<{ path: string }>(() => {}),
+    {},
+  );
+  t.after(() => picker.dispose());
+  for (let step = 0; step < CATALOG_MODELS.length; step += 1) {
+    const lines = picker.render(80);
+    assert.ok(lines.length <= 22, `pane is ${lines.length} rows at step ${step}`);
+    picker.handleInput(DOWN);
+  }
+  // The chrome survives even alongside the longest wrapped description.
+  assert.match(stripAnsi(picker.render(80).join("\n")), /Choose a transcription model/);
+});
+
+test("model picker keeps the full window on tall terminals", (t) => {
+  const build = (rows?: number) =>
+    new CatalogModelPicker(
+      testTui(rows),
+      testTheme(),
+      keybindings(),
+      ["en"],
+      undefined,
+      () => {},
+      () => new Promise<{ path: string }>(() => {}),
+      {},
+    );
+  const tall = build(50);
+  const unsized = build();
+  t.after(() => {
+    tall.dispose();
+    unsized.dispose();
+  });
+  assert.equal(tall.render(80).length, unsized.render(80).length);
+});
+
+test("language picker fits an 80x24 terminal", () => {
+  const picker = new LanguagePicker(
+    testTui(24),
+    testTheme(),
+    keybindings(),
+    ["en"],
+    "close",
+    () => {},
+  );
+  const lines = picker.render(80);
+  assert.ok(lines.length <= 22, `pane is ${lines.length} rows`);
+  const body = stripAnsi(lines.join("\n"));
+  assert.match(body, /Select the languages you speak/);
+  assert.match(body, /Continue/);
+});
+
+test("transcription language picker fits an 80x24 terminal", () => {
+  const model = CATALOG_MODELS.find(
+    (candidate) =>
+      candidate.capabilities.languageDetection && candidate.languages.length > 20,
+  )!;
+  const picker = createTranscriptionLanguagePicker(
+    testTui(24),
+    testTheme(),
+    keybindings(),
+    model,
+    "auto",
+    ["en"],
+    () => {},
+  );
+  const lines = picker.render(80);
+  assert.ok(lines.length <= 22, `pane is ${lines.length} rows`);
 });

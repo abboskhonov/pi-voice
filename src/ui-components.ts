@@ -45,6 +45,28 @@ export function selectedWindow<T>(
   return [start, Math.min(start + maximum, items.length)];
 }
 
+/** Rows the host renders below an editor-mounted pane (its two footer lines). */
+const RESERVED_HOST_ROWS = 2;
+/** Below this a list stops shrinking and the pane is left to overflow. */
+export const MIN_VISIBLE_ROWS = 3;
+
+/** Rows available to a pane, or undefined when the terminal size is unknown. */
+export function paneRowBudget(tui: TUI): number | undefined {
+  const rows = (tui as Partial<TUI>).terminal?.rows;
+  return typeof rows === "number" && rows > 0
+    ? rows - RESERVED_HOST_ROWS
+    : undefined;
+}
+
+/** Window size that fits a list into a budget of rows. */
+export function windowSizeForBudget(
+  budget: number,
+  maximum: number,
+  minimum = MIN_VISIBLE_ROWS,
+): number {
+  return Math.max(minimum, Math.min(maximum, budget));
+}
+
 export function padToWidth(value: string, width: number): string {
   const truncated = truncateToWidth(value, width, "…");
   return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
@@ -60,6 +82,14 @@ export class SingleSelectPicker<T extends string> extends Container implements F
   private readonly footer = new Text("", PANEL_PADDING, 0);
   private filtered: SingleSelectChoice<T>[];
   private selectedIndex: number;
+  /** Rows the list window may use; shrinks to fit short terminals. */
+  private visibleLimit: number;
+  /** Width of the last render; row labels are laid out against it. */
+  private renderWidth = 80;
+  /** Lines of the longest description at the cached width. */
+  private detailReserve = 0;
+  private detailReserveWidth = -1;
+  private readonly hasDescriptions: boolean;
   private _focused = false;
 
   get focused(): boolean {
@@ -86,11 +116,13 @@ export class SingleSelectPicker<T extends string> extends Container implements F
       /** Extra footer legend, appended after the ● current marker. */
       legend?: string;
       /** Custom row body after the cursor and ● markers; handles its own active styling. */
-      renderLabel?: (choice: SingleSelectChoice<T>, active: boolean) => string;
+      renderLabel?: (choice: SingleSelectChoice<T>, active: boolean, width: number) => string;
     },
     private readonly done: (value: T | undefined) => void,
   ) {
     super();
+    this.visibleLimit = options.maximumVisible ?? 10;
+    this.hasDescriptions = choices.some((choice) => choice.description);
     this.filtered = [...choices];
     this.selectedIndex = Math.max(
       0,
@@ -119,7 +151,7 @@ export class SingleSelectPicker<T extends string> extends Container implements F
     }
     this.addChild(this.list);
     this.addChild(new Spacer(1));
-    if (choices.some((choice) => choice.description)) {
+    if (this.hasDescriptions) {
       this.addChild(this.detail);
       this.addChild(new Spacer(1));
     }
@@ -148,7 +180,7 @@ export class SingleSelectPicker<T extends string> extends Container implements F
       );
       this.detail.setText("");
     } else {
-      const maximum = this.options.maximumVisible ?? 10;
+      const maximum = this.visibleLimit;
       const [start, end] = selectedWindow(
         this.filtered,
         this.selectedIndex,
@@ -164,20 +196,11 @@ export class SingleSelectPicker<T extends string> extends Container implements F
             ? this.theme.fg("accent", "● ")
             : "  ";
         const label = this.options.renderLabel
-          ? this.options.renderLabel(choice, active)
+          ? this.options.renderLabel(choice, active, this.renderWidth)
           : active
             ? this.theme.fg("accent", choice.label)
             : choice.label;
         this.list.addChild(new Text(`${prefix}${current}${label}`, LIST_PADDING, 0));
-      }
-      if (start > 0 || end < this.filtered.length) {
-        this.list.addChild(
-          new Text(
-            this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filtered.length})`),
-            LIST_PADDING,
-            0,
-          ),
-        );
       }
       this.detail.setText(
         this.filtered[this.selectedIndex]?.description
@@ -186,9 +209,16 @@ export class SingleSelectPicker<T extends string> extends Container implements F
       );
     }
 
+    // When the list is clipped the scroll position lives in this count, so
+    // the list itself never spends a row on an indicator.
+    const clipped = this.filtered.length > this.visibleLimit;
     const shown = query
-      ? `${this.filtered.length}/${this.choices.length} matching choices`
-      : `${this.choices.length} choices`;
+      ? clipped
+        ? `${this.selectedIndex + 1}/${this.filtered.length} matching choices`
+        : `${this.filtered.length}/${this.choices.length} matching choices`
+      : clipped
+        ? `${this.selectedIndex + 1}/${this.choices.length} choices`
+        : `${this.choices.length} choices`;
     const legend = [
       this.current === undefined
         ? undefined
@@ -212,6 +242,46 @@ export class SingleSelectPicker<T extends string> extends Container implements F
       this.subtitleText.setText(this.theme.fg("muted", this.options.subtitle));
     }
     this.refresh();
+  }
+
+  // The pane replaces the host editor and cannot scroll: when the terminal
+  // is short, shrink the list window so the title and footer stay on screen.
+  override render(width: number): string[] {
+    if (width !== this.renderWidth) {
+      this.renderWidth = width;
+      this.refresh();
+    }
+    const budget = paneRowBudget(this.tui);
+    if (budget !== undefined) {
+      const total = super.render(width).length;
+      const detailLines = this.detail.render(width).length;
+      const chrome =
+        total - this.list.render(width).length - detailLines + this.maxDetailLines(width);
+      const limit = windowSizeForBudget(budget - chrome, this.options.maximumVisible ?? 10);
+      if (limit !== this.visibleLimit) {
+        this.visibleLimit = limit;
+        this.refresh();
+      }
+    }
+    return super.render(width);
+  }
+
+  // Sizing against the longest description keeps the window height steady
+  // while the highlight moves across short and wrapping descriptions.
+  private maxDetailLines(width: number): number {
+    if (!this.hasDescriptions) return 0;
+    if (this.detailReserveWidth !== width) {
+      this.detailReserveWidth = width;
+      const probe = new Text("", PANEL_PADDING, 0);
+      this.detailReserve = Math.max(
+        ...this.choices.map((choice) => {
+          if (!choice.description) return 1;
+          probe.setText(choice.description);
+          return probe.render(width).length;
+        }),
+      );
+    }
+    return this.detailReserve;
   }
 
   handleInput(data: string): void {
