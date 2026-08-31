@@ -30,6 +30,7 @@ type ModelSelectionOptions = {
   chineseOutput?: ChineseOutput;
   currentModelId?: string;
   microphone?: MicrophoneSetting;
+  /** Persists language changes made before this flow activates a model. */
   onPreferredLanguagesChange?: (languages: string[]) => Promise<void>;
   postActivation?: CatalogModelPostActivation;
 };
@@ -85,12 +86,14 @@ export async function runModelSelection(
     const changed = await chooseLanguages(ctx, preferredLanguages);
     if (changed) {
       try {
-        await options.onPreferredLanguagesChange?.(changed.languages);
-        preferredLanguages = changed.languages;
         if (configured) {
-          configured = { ...configured, preferredLanguages };
-          await writeSettings(configured);
+          const updated = { ...configured, preferredLanguages: changed.languages };
+          await writeSettings(updated);
+          configured = updated;
+        } else {
+          await options.onPreferredLanguagesChange?.(changed.languages);
         }
+        preferredLanguages = changed.languages;
       } catch (error) {
         ctx.ui.notify(
           `Could not save preferred languages: ${error instanceof Error ? error.message : String(error)}`,

@@ -35,6 +35,27 @@ test("single-select picker marks the saved value separately from focus", () => {
   assert.equal(selected, "gamma");
 });
 
+test("single-select picker can act as a menu without a current marker", () => {
+  let selected: string | undefined;
+  const picker = new SingleSelectPicker(
+    testTui(),
+    testTheme(),
+    keybindings(),
+    [{ value: "model", label: "Model" }],
+    undefined,
+    { title: "Settings", cancelLabel: "close" },
+    (value) => {
+      selected = value;
+    },
+  );
+
+  const rendered = picker.render(80).join("\n");
+  assert.match(rendered, /→ Model/);
+  assert.doesNotMatch(rendered, /●|current/);
+  picker.handleInput("\r");
+  assert.equal(selected, "model");
+});
+
 test("single-select picker clears search before going back and respects width", () => {
   let closes = 0;
   const picker = new SingleSelectPicker(

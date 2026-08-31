@@ -40,6 +40,7 @@ import type { TranscriptionLanguage } from "./settings.js";
 import {
   LIST_PADDING,
   PANEL_PADDING,
+  padToWidth,
   panelBorder,
   selectedWindow,
   SingleSelectPicker,
@@ -67,11 +68,6 @@ const LANGUAGE_NAME_WIDTH = 20;
 // Below this the name column stops shrinking and rows are left to wrap.
 const MIN_MODEL_NAME_WIDTH = 12;
 const TRANSCRIPTION_LANGUAGE_NAME_WIDTH = 28;
-
-function padColumn(value: string, width: number): string {
-  const truncated = truncateToWidth(value, width, "…");
-  return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
-}
 
 function transcriptionLanguageName(
   language: string,
@@ -116,7 +112,6 @@ export class LanguagePicker extends Container implements Focusable {
     initial: readonly string[],
     private readonly cancelLabel: string,
     private readonly done: (result: LanguageSelection | undefined) => void,
-    private readonly showContinue = true,
   ) {
     super();
     const available = getCatalogLanguages();
@@ -179,12 +174,7 @@ export class LanguagePicker extends Container implements Focusable {
       const index = this.filtered.indexOf(focusLanguage);
       if (index >= 0) this.selectedIndex = index;
     }
-    this.selectedIndex = Math.min(
-      this.selectedIndex,
-      this.showContinue
-        ? this.continueRowIndex()
-        : Math.max(0, this.filtered.length - 1),
-    );
+    this.selectedIndex = Math.min(this.selectedIndex, this.continueRowIndex());
     this.list.clear();
 
     if (this.filtered.length === 0) {
@@ -220,7 +210,7 @@ export class LanguagePicker extends Container implements Focusable {
         const checked = this.selected.has(language);
         const prefix = active ? this.theme.fg("accent", "→ ") : "  ";
         const mark = checked ? this.theme.fg("success", "[×]") : this.theme.fg("dim", "[ ]");
-        const name = padColumn(displayLanguage(language), LANGUAGE_NAME_WIDTH);
+        const name = padToWidth(displayLanguage(language), LANGUAGE_NAME_WIDTH);
         this.list.addChild(
           new Text(
             `${prefix}${mark} ${active ? this.theme.fg("accent", name) : name}${this.theme.fg("dim", language)}`,
@@ -232,20 +222,18 @@ export class LanguagePicker extends Container implements Focusable {
     }
 
     const selected = this.selectedLanguages();
-    if (this.showContinue) {
-      const onContinue = this.selectedIndex === this.continueRowIndex();
-      const continuePrefix = onContinue ? this.theme.fg("accent", "→ ") : "  ";
-      const continueAction = ` ${keyText("tui.input.tab")}  Continue `;
-      const continueRow = selected.length === 0
-        ? this.theme.fg("warning", "Select at least one language to continue")
-        : this.theme.inverse(
-            onContinue
-              ? this.theme.fg("accent", this.theme.bold(continueAction))
-              : this.theme.fg("success", continueAction),
-          );
-      this.list.addChild(new Spacer(1));
-      this.list.addChild(new Text(`${continuePrefix}${continueRow}`, LIST_PADDING, 0));
-    }
+    const onContinue = this.selectedIndex === this.continueRowIndex();
+    const continuePrefix = onContinue ? this.theme.fg("accent", "→ ") : "  ";
+    const continueAction = ` ${keyText("tui.input.tab")}  Continue `;
+    const continueRow = selected.length === 0
+      ? this.theme.fg("warning", "Select at least one language to continue")
+      : this.theme.inverse(
+          onContinue
+            ? this.theme.fg("accent", this.theme.bold(continueAction))
+            : this.theme.fg("success", continueAction),
+        );
+    this.list.addChild(new Spacer(1));
+    this.list.addChild(new Text(`${continuePrefix}${continueRow}`, LIST_PADDING, 0));
 
     this.footer.setText(
       `${rawKeyHint("↑↓", "move")}  ${rawKeyHint("space/enter", "select")}  ${keyHint("tui.select.cancel", query ? "clear search" : this.cancelLabel)}`,
@@ -269,9 +257,7 @@ export class LanguagePicker extends Container implements Focusable {
   }
 
   handleInput(data: string): void {
-    const lastIndex = this.showContinue
-      ? this.continueRowIndex()
-      : Math.max(0, this.filtered.length - 1);
+    const lastIndex = this.continueRowIndex();
     if (this.keybindings.matches(data, "tui.input.tab")) {
       const selected = this.selectedLanguages();
       if (selected.length > 0) this.done({ languages: selected, confirmed: true });
@@ -292,7 +278,7 @@ export class LanguagePicker extends Container implements Focusable {
       return;
     }
     if (this.keybindings.matches(data, "tui.select.confirm")) {
-      if (this.showContinue && this.selectedIndex === this.continueRowIndex()) {
+      if (this.selectedIndex === this.continueRowIndex()) {
         const selected = this.selectedLanguages();
         if (selected.length > 0) this.done({ languages: selected, confirmed: true });
         return;
@@ -571,7 +557,7 @@ export class CatalogModelPicker extends Container implements Focusable {
         const current = model.id === displayedId
           ? this.theme.fg("accent", "●")
           : " ";
-        const nameText = padColumn(model.name, nameWidth);
+        const nameText = padToWidth(model.name, nameWidth);
         const name = active ? this.theme.fg("accent", nameText) : nameText;
         // The ✓ has its own column ahead of the right-aligned size, so neither
         // the mark nor the number shifts with the size's digit count.
@@ -688,12 +674,9 @@ export class CatalogModelPicker extends Container implements Focusable {
       return;
     }
     this.mode = "models";
-    this.feedback = {
-      type: "success",
-      text: wasCached
-        ? `Selected ${model.name}`
-        : `✓ Downloaded and selected ${model.name}`,
-    };
+    this.feedback = wasCached
+      ? undefined
+      : { type: "success", text: `✓ Downloaded and selected ${model.name}` };
     this.refresh();
   }
 
@@ -979,7 +962,7 @@ export function createTranscriptionLanguagePicker(
         ? `${theme.fg("accent", "★")} ${theme.fg("dim", "preferred language")}`
         : undefined,
       renderLabel: (choice, active) => {
-        const nameText = padColumn(choice.label, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
+        const nameText = padToWidth(choice.label, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
         const name = active ? theme.fg("accent", nameText) : nameText;
         const code = choice.value === "auto" ? "" : theme.fg("dim", choice.value);
         const yours = isPreferred(choice.value) ? `  ${theme.fg("accent", "★")}` : "";

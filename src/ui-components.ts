@@ -12,6 +12,8 @@ import {
   Input,
   Spacer,
   Text,
+  truncateToWidth,
+  visibleWidth,
   type KeybindingsManager,
   type TUI,
 } from "@earendil-works/pi-tui";
@@ -43,7 +45,12 @@ export function selectedWindow<T>(
   return [start, Math.min(start + maximum, items.length)];
 }
 
-/** Pi-native single-choice picker with optional fuzzy search and a current-value marker. */
+export function padToWidth(value: string, width: number): string {
+  const truncated = truncateToWidth(value, width, "…");
+  return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
+}
+
+/** Pi-native single-choice picker with optional fuzzy search and current-value marker. */
 export class SingleSelectPicker<T extends string> extends Container implements Focusable {
   private readonly search = new Input();
   private readonly titleText: Text;
@@ -69,7 +76,7 @@ export class SingleSelectPicker<T extends string> extends Container implements F
     private readonly theme: UiTheme,
     private readonly keybindings: KeybindingsManager,
     private readonly choices: readonly SingleSelectChoice<T>[],
-    private readonly current: T,
+    private readonly current: T | undefined,
     private readonly options: {
       title: string;
       subtitle?: string;
@@ -151,9 +158,11 @@ export class SingleSelectPicker<T extends string> extends Container implements F
         const choice = this.filtered[index]!;
         const active = index === this.selectedIndex;
         const prefix = active ? this.theme.fg("accent", "→ ") : "  ";
-        const current = choice.value === this.current
-          ? this.theme.fg("accent", "● ")
-          : "  ";
+        const current = this.current === undefined
+          ? ""
+          : choice.value === this.current
+            ? this.theme.fg("accent", "● ")
+            : "  ";
         const label = this.options.renderLabel
           ? this.options.renderLabel(choice, active)
           : active
@@ -181,13 +190,15 @@ export class SingleSelectPicker<T extends string> extends Container implements F
       ? `${this.filtered.length}/${this.choices.length} matching choices`
       : `${this.choices.length} choices`;
     const legend = [
-      `${this.theme.fg("accent", "●")} ${this.theme.fg("dim", "current")}`,
+      this.current === undefined
+        ? undefined
+        : `${this.theme.fg("accent", "●")} ${this.theme.fg("dim", "current")}`,
       this.options.legend,
     ]
       .filter((value): value is string => Boolean(value))
       .join("  ");
     this.footer.setText(
-      `${this.theme.fg("dim", shown)}  ${legend}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", query ? "clear search" : (this.options.cancelLabel ?? "back"))}`,
+      `${this.theme.fg("dim", shown)}${legend ? `  ${legend}` : ""}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", query ? "clear search" : (this.options.cancelLabel ?? "back"))}`,
     );
     this.tui.requestRender();
   }

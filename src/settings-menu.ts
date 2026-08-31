@@ -1,51 +1,49 @@
-import {
-  getSettingsListTheme,
-  type ExtensionAPI,
-  type ExtensionContext,
+import type {
+  ExtensionAPI,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import {
-  Container,
-  type Focusable,
-  SettingsList,
-  Spacer,
-  Text,
-  type Component,
-  type KeybindingsManager,
-  type SettingItem,
-  type TUI,
-} from "@earendil-works/pi-tui";
 import { getAvailableMicrophones, testMicrophonePermission } from "./audio.js";
 import { displayLanguage, getCatalogModel } from "./catalog.js";
 import { chineseOutputSummary, isChineseLanguage } from "./chinese.js";
-import { createModelActivation } from "./model-activation.js";
 import {
-  CatalogModelPicker,
+  chooseLanguages,
   createTranscriptionLanguagePicker,
-  LanguagePicker,
   transcriptionLanguageSummary,
-  type CatalogModelPickerResult,
-  type LanguageSelection,
 } from "./model-picker.js";
+import { runModelSelection } from "./onboarding.js";
 import {
-  settingsForModel,
   writeSettings,
   type ChineseOutput,
   type MicrophoneSetting,
   type TranscribeSettings,
+  type TranscriptionLanguage,
 } from "./settings.js";
 import { displayShortcut } from "./shortcut-core.js";
 import { createShortcutPicker } from "./shortcuts.js";
 import {
-  PANEL_PADDING,
+  padToWidth,
   SingleSelectPicker,
-  panelBorder,
   type SingleSelectChoice,
 } from "./ui-components.js";
 
 const MACOS_MICROPHONE_SETTINGS_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+const SETTINGS_LABEL_WIDTH = 25;
 
-type UiTheme = ExtensionContext["ui"]["theme"];
+type MicrophonePermission = Awaited<ReturnType<typeof testMicrophonePermission>>;
+type SettingsAction =
+  | "preferred-languages"
+  | "model"
+  | "transcription-language"
+  | "chinese-output"
+  | "microphone"
+  | "shortcut";
+
+type SettingsHomeChoice = SingleSelectChoice<SettingsAction> & {
+  summary: string;
+  /** Render the summary in the error color. */
+  alert?: boolean;
+};
 
 function preferredLanguagesSummary(languages: readonly string[]): string {
   const names = languages.map(displayLanguage);
@@ -67,6 +65,10 @@ function microphonesEqual(left: MicrophoneSetting, right: MicrophoneSetting): bo
         left.name === right.name &&
         left.occurrence === right.occurrence))
   );
+}
+
+function languagesEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.join("\0") === right.join("\0");
 }
 
 async function saveUpdatedSettings(
@@ -123,173 +125,209 @@ function microphoneChoices(
   return { choices, currentValue, byValue };
 }
 
-type SubmenuComponent = Component & Partial<Focusable> & { dispose?: () => void };
-
-/** SettingsList keeps its active submenu private, so mirror focus for nested Inputs. */
-class FocusableSettingsList extends SettingsList implements Focusable {
-  private _focused = false;
-
-  get focused(): boolean {
-    return this._focused;
+function microphonePermissionSummary(result: MicrophonePermission): string {
+  if (result.status === "granted") return "Microphone: ✓ Access granted";
+  if (result.status === "denied") return "Microphone: ✗ Access denied";
+  if (result.status === "not-determined") {
+    return "Microphone: ⚠ Not yet requested — first recording will prompt for access";
   }
-
-  set focused(value: boolean) {
-    this._focused = value;
-    this.syncSubmenuFocus();
-  }
-
-  get showingSubmenu(): boolean {
-    return this.getActiveSubmenu() !== null;
-  }
-
-  override handleInput(data: string): void {
-    super.handleInput(data);
-    this.syncSubmenuFocus();
-  }
-
-  private getActiveSubmenu(): Partial<Focusable> | null {
-    return Reflect.get(this, "submenuComponent") as Partial<Focusable> | null;
-  }
-
-  private syncSubmenuFocus(): void {
-    const submenu = this.getActiveSubmenu();
-    if (submenu && "focused" in submenu) submenu.focused = this._focused;
-  }
+  return `Microphone: ⚠ ${result.message}`;
 }
 
-/** Keeps the rich model/language workflow inside a SettingsList submenu. */
-class ModelSettingsSubmenu extends Container implements Focusable {
-  private active: SubmenuComponent | undefined;
-  private _focused = false;
-  private selectedDuringSession = false;
-  private disposed = false;
-  private readonly activation: ReturnType<typeof createModelActivation>;
+function settingsHomeChoices(
+  configured: TranscribeSettings,
+  permission: MicrophonePermission,
+): SettingsHomeChoice[] {
+  const model = getCatalogModel(configured.model.id)!;
+  const choices: SettingsHomeChoice[] = [
+    {
+      value: "preferred-languages",
+      label: "Preferred languages",
+      summary: preferredLanguagesSummary(configured.preferredLanguages),
+      description: "Languages you speak, used to rank and recommend transcription models",
+    },
+    {
+      value: "model",
+      label: "Model",
+      summary: model.name,
+      description: "Local speech-recognition model; audio never leaves this machine",
+    },
+    {
+      value: "transcription-language",
+      label: "Transcription language",
+      summary: transcriptionLanguageSummary(configured.transcriptionLanguage, model),
+      description: "Language expected in recordings, or automatic detection when supported",
+    },
+  ];
 
-  get focused(): boolean {
-    return this._focused;
-  }
-
-  set focused(value: boolean) {
-    this._focused = value;
-    if (this.active && "focused" in this.active) this.active.focused = value;
-  }
-
-  constructor(
-    private readonly ctx: ExtensionContext,
-    private readonly tui: TUI,
-    private readonly theme: UiTheme,
-    private readonly keybindings: KeybindingsManager,
-    private readonly configured: TranscribeSettings,
-    private readonly onUpdated: () => void,
-    private readonly done: (value?: string) => void,
+  if (
+    isChineseLanguage(configured.transcriptionLanguage) ||
+    configured.preferredLanguages.some(isChineseLanguage)
   ) {
-    super();
-    this.activation = createModelActivation({
-      buildSettings: (model, path) =>
-        settingsForModel(model.id, path, {
-          shortcut: this.configured.shortcut,
-          preferredLanguages: this.configured.preferredLanguages,
-          transcriptionLanguage: this.configured.transcriptionLanguage,
-          chineseOutput: this.configured.chineseOutput,
-          microphone: this.configured.microphone,
-        }),
-      onCommitted: (settings) => {
-        Object.assign(this.configured, settings);
-        this.selectedDuringSession = true;
-        this.onUpdated();
-      },
+    choices.push({
+      value: "chinese-output",
+      label: "Chinese output",
+      summary: chineseOutputSummary(configured.chineseOutput),
+      description: "Character style used for Chinese transcripts",
     });
-    this.showModels();
   }
 
-  private setActive(component: SubmenuComponent): void {
-    this.active?.dispose?.();
-    this.active = component;
-    if ("focused" in component) component.focused = this._focused;
-    this.clear();
-    this.addChild(component);
-    this.tui.requestRender();
-  }
+  choices.push(
+    {
+      value: "microphone",
+      label: "Microphone",
+      // A permission problem replaces the device summary so it is visible
+      // from the home screen; selecting the row then goes straight to the
+      // System Settings fix.
+      ...(permission.status === "denied" && process.platform === "darwin"
+        ? {
+            summary: "✗ Access denied",
+            alert: true,
+            description: "Grant microphone access to the terminal application running Pi",
+          }
+        : {
+            summary: microphoneSummary(configured.microphone),
+            description: "Input device used for dictation",
+          }),
+    },
+    {
+      value: "shortcut",
+      label: "Shortcut",
+      summary: displayShortcut(configured.shortcut),
+      description: "Terminal shortcut that starts and stops microphone dictation",
+    },
+  );
 
-  private showModels(): void {
-    const picker = new CatalogModelPicker(
-      this.tui,
-      this.theme,
-      this.keybindings,
-      this.configured.preferredLanguages,
-      this.configured.model.id,
-      (result) => void this.handleModelResult(result),
-      this.activation.activate,
+  return choices;
+}
+
+async function showSettingsHome(
+  ctx: ExtensionContext,
+  configured: TranscribeSettings,
+  permission: MicrophonePermission,
+): Promise<SettingsAction | undefined> {
+  return ctx.ui.custom<SettingsAction | undefined>((tui, theme, keybindings, done) => {
+    const choices = settingsHomeChoices(configured, permission);
+    const rows = new Map(choices.map((choice) => [choice.value, choice]));
+    return new SingleSelectPicker(
+      tui,
+      theme,
+      keybindings,
+      choices,
+      undefined,
       {
-        postActivation: "stay",
-        activatedInFlow: this.selectedDuringSession,
+        title: "pi-transcribe settings",
+        cancelLabel: "close",
+        renderLabel: (choice, active) => {
+          const row = rows.get(choice.value);
+          const labelText = padToWidth(choice.label, SETTINGS_LABEL_WIDTH);
+          const label = active ? theme.fg("accent", labelText) : labelText;
+          const summary = row?.summary ?? "";
+          const value = row?.alert
+            ? theme.fg("error", summary)
+            : theme.fg("dim", summary);
+          return `${label}  ${value}`;
+        },
       },
+      done,
     );
-    this.setActive(picker);
-  }
+  });
+}
 
-  private async handleModelResult(
-    result: CatalogModelPickerResult | undefined,
-  ): Promise<void> {
-    await this.activation.waitForCommits();
-    if (this.disposed) return;
-    if (result?.type === "change-languages") {
-      this.showLanguages();
-      return;
-    }
-    this.close();
-  }
+async function chooseChineseOutput(
+  ctx: ExtensionContext,
+  current: ChineseOutput,
+): Promise<ChineseOutput | undefined> {
+  const choices: SingleSelectChoice<ChineseOutput>[] = [
+    {
+      value: "simplified",
+      label: "Simplified",
+      description: "Convert Chinese transcripts to simplified characters",
+    },
+    {
+      value: "traditional-taiwan",
+      label: "Traditional (Taiwan)",
+      description: "Use traditional characters and Taiwan conventions",
+    },
+    {
+      value: "traditional-hong-kong",
+      label: "Traditional (Hong Kong)",
+      description: "Use traditional characters and Hong Kong conventions",
+    },
+  ];
+  return ctx.ui.custom<ChineseOutput | undefined>((tui, theme, keybindings, done) =>
+    new SingleSelectPicker(
+      tui,
+      theme,
+      keybindings,
+      choices,
+      current,
+      { title: "Choose Chinese output", cancelLabel: "back" },
+      done,
+    ),
+  );
+}
 
-  private showLanguages(): void {
-    const picker = new LanguagePicker(
-      this.tui,
-      this.theme,
-      this.keybindings,
-      this.configured.preferredLanguages,
-      "back",
-      (selection) => void this.handleLanguages(selection),
-      false,
+async function chooseMicrophone(
+  ctx: ExtensionContext,
+  current: MicrophoneSetting,
+  permission: MicrophonePermission,
+): Promise<MicrophoneSetting | undefined> {
+  let devices: string[] = [];
+  try {
+    devices = getAvailableMicrophones();
+  } catch (error) {
+    ctx.ui.notify(
+      `Could not list microphones: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
     );
-    this.setActive(picker);
   }
+  const { choices, currentValue, byValue } = microphoneChoices(devices, current);
+  const selected = await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) =>
+    new SingleSelectPicker(
+      tui,
+      theme,
+      keybindings,
+      choices,
+      currentValue,
+      {
+        title: "Choose microphone input",
+        subtitle: microphonePermissionSummary(permission),
+        searchable: choices.length > 8,
+        cancelLabel: "back",
+      },
+      done,
+    ),
+  );
+  return selected ? byValue.get(selected) : undefined;
+}
 
-  private async handleLanguages(selection: LanguageSelection | undefined): Promise<void> {
-    if (selection) {
-      const preferredLanguages = selection.languages;
-      if (
-        preferredLanguages.join("\0") !== this.configured.preferredLanguages.join("\0")
-      ) {
-        const updated = { ...this.configured, preferredLanguages };
-        if (
-          await saveUpdatedSettings(
-            this.ctx,
-            this.configured,
-            updated,
-            "Preferred languages saved",
-          )
-        ) {
-          this.onUpdated();
-        }
-      }
-    }
-    if (!this.disposed) this.showModels();
-  }
+async function chooseTranscriptionLanguage(
+  ctx: ExtensionContext,
+  configured: TranscribeSettings,
+): Promise<TranscriptionLanguage | undefined> {
+  const model = getCatalogModel(configured.model.id)!;
+  return ctx.ui.custom<TranscriptionLanguage | undefined>(
+    (tui, theme, keybindings, done) =>
+      createTranscriptionLanguagePicker(
+        tui,
+        theme,
+        keybindings,
+        model,
+        configured.transcriptionLanguage,
+        configured.preferredLanguages,
+        done,
+      ),
+  );
+}
 
-  private close(): void {
-    if (this.disposed) return;
-    this.disposed = true;
-    this.active?.dispose?.();
-    this.done(getCatalogModel(this.configured.model.id)?.name ?? this.configured.model.id);
-  }
-
-  handleInput(data: string): void {
-    this.active?.handleInput?.(data);
-  }
-
-  dispose(): void {
-    this.disposed = true;
-    this.active?.dispose?.();
-  }
+async function chooseShortcut(
+  ctx: ExtensionContext,
+  current: string,
+): Promise<string | undefined> {
+  return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) =>
+    createShortcutPicker(tui, theme, keybindings, current, done),
+  );
 }
 
 export async function openMacOSMicrophoneSettings(
@@ -334,338 +372,117 @@ export async function showSettingsMenu(
     return false;
   }
 
-  const micResult = await testMicrophonePermission();
-  let devices: string[] = [];
-  try {
-    devices = getAvailableMicrophones();
-  } catch (error) {
-    ctx.ui.notify(
-      `Could not list microphones: ${error instanceof Error ? error.message : String(error)}`,
-      "error",
-    );
-  }
+  let reload = configured.shortcut !== registeredShortcut;
+  // Checked on open and refreshed whenever the Microphone row is activated,
+  // where access problems are surfaced and fixed.
+  let permission = await testMicrophonePermission();
+  while (true) {
+    const action = await showSettingsHome(ctx, configured, permission);
+    if (!action) return reload;
 
-  return ctx.ui.custom<boolean>((tui, theme, keybindings, done) => {
-    let reload = configured.shortcut !== registeredShortcut;
-    let settingsList!: FocusableSettingsList;
-
-    const updateDisplayedValues = (): void => {
-      const model = getCatalogModel(configured.model.id)!;
-      settingsList.updateValue(
-        "preferred-languages",
-        preferredLanguagesSummary(configured.preferredLanguages),
-      );
-      settingsList.updateValue("model", model.name);
-      settingsList.updateValue(
-        "transcription-language",
-        transcriptionLanguageSummary(configured.transcriptionLanguage, model),
-      );
-      settingsList.updateValue("chinese-output", chineseOutputSummary(configured.chineseOutput));
-      settingsList.updateValue("microphone", microphoneSummary(configured.microphone));
-      settingsList.updateValue("shortcut", displayShortcut(configured.shortcut));
-      tui.requestRender();
-    };
-
-    // Shared submenu epilogue: an unchanged value just closes; a changed one
-    // is saved, reflected in the list, and then closes.
-    const commitSetting = (
-      close: (value?: string) => void,
-      options: {
-        summary: string;
-        unchanged: boolean;
-        patch: Partial<TranscribeSettings>;
-        message?: string;
-        onSaved?: () => void;
-      },
-    ): void => {
-      if (options.unchanged) {
-        close(options.summary);
-        return;
+    if (action === "preferred-languages") {
+      const selection = await chooseLanguages(ctx, configured.preferredLanguages, {
+        cancelLabel: "back",
+      });
+      if (!selection || languagesEqual(selection.languages, configured.preferredLanguages)) {
+        continue;
       }
-      void saveUpdatedSettings(
+      await saveUpdatedSettings(
         ctx,
         configured,
-        { ...configured, ...options.patch },
-        options.message,
-      ).then((saved) => {
-        if (!saved) return;
-        options.onSaved?.();
-        updateDisplayedValues();
-        close(options.summary);
-      });
-    };
-
-    const model = getCatalogModel(configured.model.id)!;
-    const chineseChoices: SingleSelectChoice<ChineseOutput>[] = [
-      {
-        value: "simplified",
-        label: "Simplified",
-        description: "Convert Chinese transcripts to simplified characters",
-      },
-      {
-        value: "traditional-taiwan",
-        label: "Traditional (Taiwan)",
-        description: "Use traditional characters and Taiwan conventions",
-      },
-      {
-        value: "traditional-hong-kong",
-        label: "Traditional (Hong Kong)",
-        description: "Use traditional characters and Hong Kong conventions",
-      },
-    ];
-
-    // Character-style conversion only matters when Chinese can appear in
-    // transcripts; hide the setting otherwise.
-    const showChineseOutput =
-      isChineseLanguage(configured.transcriptionLanguage) ||
-      configured.preferredLanguages.some(isChineseLanguage);
-    const chineseOutputItem: SettingItem = {
-      id: "chinese-output",
-      label: "Chinese output",
-      currentValue: chineseOutputSummary(configured.chineseOutput),
-      description: "Character style used for Chinese transcripts",
-      submenu: (_currentValue, close) =>
-        new SingleSelectPicker(
-          tui,
-          theme,
-          keybindings,
-          chineseChoices,
-          configured.chineseOutput,
-          { title: "Choose Chinese output", cancelLabel: "back" },
-          (chineseOutput) => {
-            if (!chineseOutput) {
-              close();
-              return;
-            }
-            const summary = chineseOutputSummary(chineseOutput);
-            commitSetting(close, {
-              summary,
-              unchanged: chineseOutput === configured.chineseOutput,
-              patch: { chineseOutput },
-              message: `Chinese output saved as ${summary}`,
-            });
-          },
-        ),
-    };
-
-    const items: SettingItem[] = [
-      {
-        id: "preferred-languages",
-        label: "Preferred languages",
-        currentValue: preferredLanguagesSummary(configured.preferredLanguages),
-        description: "Languages you speak, used to rank and recommend transcription models",
-        submenu: (_currentValue, close) =>
-          new LanguagePicker(
-            tui,
-            theme,
-            keybindings,
-            configured.preferredLanguages,
-            "back",
-            (selection) => {
-              if (!selection) {
-                close();
-                return;
-              }
-              commitSetting(close, {
-                summary: preferredLanguagesSummary(selection.languages),
-                unchanged:
-                  selection.languages.join("\0") ===
-                  configured.preferredLanguages.join("\0"),
-                patch: { preferredLanguages: selection.languages },
-                message: "Preferred languages saved",
-              });
-            },
-            false,
-          ),
-      },
-      {
-        id: "model",
-        label: "Model",
-        currentValue: model.name,
-        description: "Local speech-recognition model; audio never leaves this machine",
-        submenu: (_currentValue, close) =>
-          new ModelSettingsSubmenu(
-            ctx,
-            tui,
-            theme,
-            keybindings,
-            configured,
-            updateDisplayedValues,
-            close,
-          ),
-      },
-      {
-        id: "transcription-language",
-        label: "Transcription language",
-        currentValue: transcriptionLanguageSummary(configured.transcriptionLanguage, model),
-        description: "Language expected in recordings, or automatic detection when supported",
-        submenu: (_currentValue, close) => {
-          const currentModel = getCatalogModel(configured.model.id)!;
-          return createTranscriptionLanguagePicker(
-            tui,
-            theme,
-            keybindings,
-            currentModel,
-            configured.transcriptionLanguage,
-            configured.preferredLanguages,
-            (transcriptionLanguage) => {
-              if (!transcriptionLanguage) {
-                close();
-                return;
-              }
-              const summary = transcriptionLanguageSummary(
-                transcriptionLanguage,
-                currentModel,
-              );
-              commitSetting(close, {
-                summary,
-                unchanged: transcriptionLanguage === configured.transcriptionLanguage,
-                patch: { transcriptionLanguage },
-                message: `Transcription language saved as ${summary}`,
-              });
-            },
-          );
-        },
-      },
-      ...(showChineseOutput ? [chineseOutputItem] : []),
-      {
-        id: "microphone",
-        label: "Microphone",
-        currentValue: microphoneSummary(configured.microphone),
-        description: "Input device used for dictation",
-        submenu: (_currentValue, close) => {
-          const { choices, currentValue, byValue } = microphoneChoices(
-            devices,
-            configured.microphone,
-          );
-          return new SingleSelectPicker(
-            tui,
-            theme,
-            keybindings,
-            choices,
-            currentValue,
-            {
-              title: "Choose microphone input",
-              searchable: choices.length > 8,
-              cancelLabel: "back",
-            },
-            (value) => {
-              if (!value) {
-                close();
-                return;
-              }
-              const microphone = byValue.get(value);
-              if (!microphone) return;
-              const summary = microphoneSummary(microphone);
-              commitSetting(close, {
-                summary,
-                unchanged: microphonesEqual(microphone, configured.microphone),
-                patch: { microphone },
-                message: `Microphone saved as ${summary}`,
-              });
-            },
-          );
-        },
-      },
-      {
-        id: "shortcut",
-        label: "Shortcut",
-        currentValue: displayShortcut(configured.shortcut),
-        description: "Terminal shortcut that starts and stops microphone dictation",
-        submenu: (_currentValue, close) =>
-          createShortcutPicker(
-            tui,
-            theme,
-            keybindings,
-            configured.shortcut,
-            (shortcut) => {
-              if (!shortcut) {
-                close();
-                return;
-              }
-              commitSetting(close, {
-                summary: displayShortcut(shortcut),
-                unchanged: shortcut === configured.shortcut,
-                patch: { shortcut },
-                onSaved: () => {
-                  reload = shortcut !== registeredShortcut;
-                  ctx.ui.notify(
-                    `Shortcut saved as ${displayShortcut(shortcut)}. It will apply when settings close; other open Pi processes must be reloaded separately.`,
-                    "info",
-                  );
-                },
-              });
-            },
-          ),
-      },
-    ];
-
-    if (micResult.status === "denied" && process.platform === "darwin") {
-      items.unshift({
-        id: "microphone-access",
-        label: "Microphone access",
-        currentValue: "Denied — open System Settings",
-        description: "Grant microphone access to the terminal application running Pi",
-        values: ["Denied — open System Settings"],
-      });
+        { ...configured, preferredLanguages: selection.languages },
+        "Preferred languages saved",
+      );
+      continue;
     }
 
-    const nativeTheme = getSettingsListTheme();
-    settingsList = new FocusableSettingsList(
-      items,
-      10,
-      {
-        ...nativeTheme,
-        hint: (text) => nativeTheme.hint(text.replace("Esc to cancel", "Esc to close")),
-      },
-      (id) => {
-        if (id === "microphone-access") void openMacOSMicrophoneSettings(pi, ctx);
-      },
-      () => done(reload),
-    );
-
-    let micLine: string;
-    if (micResult.status === "granted") {
-      micLine = `Microphone: ${theme.fg("success", "✓ Access granted")}`;
-    } else if (micResult.status === "denied") {
-      micLine = `Microphone: ${theme.fg("error", "✗ Access denied")}`;
-    } else if (micResult.status === "not-determined") {
-      micLine = `Microphone: ${theme.fg("warning", "⚠ Not yet requested")} — first recording will prompt for access`;
-    } else {
-      micLine = `Microphone: ${theme.fg("warning", "⚠")} ${micResult.message}`;
+    if (action === "model") {
+      const updated = await runModelSelection(ctx, {
+        shortcut: configured.shortcut,
+        preferredLanguages: configured.preferredLanguages,
+        transcriptionLanguage: configured.transcriptionLanguage,
+        chineseOutput: configured.chineseOutput,
+        currentModelId: configured.model.id,
+        microphone: configured.microphone,
+        postActivation: "stay",
+        onPreferredLanguagesChange: async (preferredLanguages) => {
+          if (languagesEqual(preferredLanguages, configured.preferredLanguages)) return;
+          const next = { ...configured, preferredLanguages };
+          await writeSettings(next);
+          Object.assign(configured, next);
+          ctx.ui.notify("Preferred languages saved", "info");
+        },
+      });
+      if (updated) Object.assign(configured, updated);
+      continue;
     }
 
-    const container = new Container();
-    container.addChild(panelBorder(theme));
-    container.addChild(new Spacer(1));
-    container.addChild(
-      new Text(theme.fg("accent", theme.bold("pi-transcribe settings")), PANEL_PADDING, 0),
-    );
-    container.addChild(new Text(micLine, PANEL_PADDING, 0));
-    container.addChild(new Spacer(1));
-    container.addChild(settingsList);
-    container.addChild(new Spacer(1));
-    container.addChild(panelBorder(theme));
+    if (action === "transcription-language") {
+      const transcriptionLanguage = await chooseTranscriptionLanguage(ctx, configured);
+      if (
+        !transcriptionLanguage ||
+        transcriptionLanguage === configured.transcriptionLanguage
+      ) {
+        continue;
+      }
+      const model = getCatalogModel(configured.model.id)!;
+      const summary = transcriptionLanguageSummary(transcriptionLanguage, model);
+      await saveUpdatedSettings(
+        ctx,
+        configured,
+        { ...configured, transcriptionLanguage },
+        `Transcription language saved as ${summary}`,
+      );
+      continue;
+    }
 
-    return {
-      get focused(): boolean {
-        return settingsList.focused;
-      },
-      set focused(value: boolean) {
-        settingsList.focused = value;
-      },
-      // SettingsList replaces only its own rows when a submenu opens. Render
-      // that submenu as the whole pane so we do not leave the settings frame
-      // and microphone summary wrapped around a second bordered panel.
-      render: (width) =>
-        settingsList.showingSubmenu
-          ? settingsList.render(width)
-          : container.render(width),
-      invalidate: () => container.invalidate(),
-      handleInput: (data) => {
-        settingsList.handleInput(data);
-        tui.requestRender();
-      },
-    };
-  });
+    if (action === "chinese-output") {
+      const chineseOutput = await chooseChineseOutput(ctx, configured.chineseOutput);
+      if (!chineseOutput || chineseOutput === configured.chineseOutput) continue;
+      const summary = chineseOutputSummary(chineseOutput);
+      await saveUpdatedSettings(
+        ctx,
+        configured,
+        { ...configured, chineseOutput },
+        `Chinese output saved as ${summary}`,
+      );
+      continue;
+    }
+
+    if (action === "microphone") {
+      permission = await testMicrophonePermission();
+      if (permission.status === "denied" && process.platform === "darwin") {
+        // Choosing a device is pointless while capture is blocked; go
+        // straight to the fix.
+        await openMacOSMicrophoneSettings(pi, ctx);
+        continue;
+      }
+      const microphone = await chooseMicrophone(ctx, configured.microphone, permission);
+      if (!microphone || microphonesEqual(microphone, configured.microphone)) continue;
+      const summary = microphoneSummary(microphone);
+      await saveUpdatedSettings(
+        ctx,
+        configured,
+        { ...configured, microphone },
+        `Microphone saved as ${summary}`,
+      );
+      continue;
+    }
+
+    if (action === "shortcut") {
+      const shortcut = await chooseShortcut(ctx, configured.shortcut);
+      if (!shortcut || shortcut === configured.shortcut) continue;
+      const saved = await saveUpdatedSettings(ctx, configured, {
+        ...configured,
+        shortcut,
+      });
+      if (saved) {
+        reload = configured.shortcut !== registeredShortcut;
+        ctx.ui.notify(
+          `Shortcut saved as ${displayShortcut(shortcut)}. It will apply when settings close; other open Pi processes must be reloaded separately.`,
+          "info",
+        );
+      }
+    }
+  }
 }
