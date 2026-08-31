@@ -56,8 +56,8 @@ function formatEta(seconds: number): string {
 const TEXT_PADDING = PANEL_PADDING;
 // Longest catalog language name is "Norwegian Nynorsk" (17).
 const LANGUAGE_NAME_WIDTH = 20;
-const MODEL_NAME_WIDTH = 34;
-const MODEL_SIZE_WIDTH = 11;
+// Below this the name column stops shrinking and rows are left to wrap.
+const MIN_MODEL_NAME_WIDTH = 12;
 const TRANSCRIPTION_LANGUAGE_NAME_WIDTH = 28;
 
 function padColumn(value: string, width: number): string {
@@ -341,12 +341,18 @@ export class CatalogModelPicker extends Container implements Focusable {
   private readonly searchBox = new Box(LIST_PADDING, 0);
   private readonly body = new Container();
   private readonly preferredLine = new Text("", TEXT_PADDING, 0);
+  private readonly currentLine = new Text("", TEXT_PADDING, 0);
   private readonly list = new Container();
   private readonly detail = new Text("", TEXT_PADDING, 0);
   private readonly footer = new Text("", TEXT_PADDING, 0);
   private readonly cachedById = new Map<string, CachedCatalogModel>();
   private readonly models: CatalogModel[];
   private readonly languageColumns: readonly string[];
+  /** Widest model name / formatted size in the catalog; column ceilings. */
+  private readonly modelNameWidth: number;
+  private readonly modelSizeWidth: number;
+  /** Width of the last render; row columns are laid out against it. */
+  private renderWidth = 80;
   private filtered: CatalogModel[] = [];
   private selectedIndex = 0;
   /** Last selection whose activation finished; what settings actually hold. */
@@ -407,18 +413,19 @@ export class CatalogModelPicker extends Container implements Focusable {
       if (current) this.models.unshift(current);
     }
 
+    this.modelNameWidth = Math.max(
+      ...this.models.map((model) => visibleWidth(model.name)),
+    );
+    this.modelSizeWidth = Math.max(
+      ...this.models.map((model) => visibleWidth(formatBinarySize(model.size))),
+    );
+
     this.searchBox.addChild(this.search);
     this.addChild(panelBorder(theme));
     this.addChild(new Spacer(1));
     this.addChild(new Text(theme.fg("accent", theme.bold("Choose a transcription model")), TEXT_PADDING, 0));
     this.addChild(this.preferredLine);
-    this.addChild(
-      new Text(
-        theme.fg("dim", "Models run locally — audio never leaves this machine."),
-        TEXT_PADDING,
-        0,
-      ),
-    );
+    this.addChild(this.currentLine);
     this.addChild(this.body);
     this.addChild(new Spacer(1));
     this.addChild(panelBorder(theme));
@@ -444,18 +451,35 @@ export class CatalogModelPicker extends Container implements Focusable {
     return this.target?.model.id ?? this.committedModelId;
   }
 
+  // Column widths depend on the terminal: relay out when the width changes so
+  // rows truncate their name column instead of wrapping onto a second line.
+  override render(width: number): string[] {
+    if (width !== this.renderWidth) {
+      this.renderWidth = width;
+      this.refresh();
+    }
+    return super.render(width);
+  }
+
   private refresh(): void {
     this.body.clear();
-    const preferred = this.theme.fg(
-      "muted",
-      `Preferred: ${this.preferredLanguages.map(displayLanguage).join(", ")}`,
-    );
     const preferredAction = this.selectedDuringSession
       ? this.continueAfterActivation
         ? ` · ${keyHint("tui.input.tab", "continue")}`
         : ""
       : ` · ${keyHint("tui.input.tab", "change")}`;
-    this.preferredLine.setText(`${preferred}${preferredAction}`);
+    const languagesText = truncateToWidth(
+      `Languages: ${this.preferredLanguages.map(displayLanguage).join(", ")}`,
+      Math.max(24, this.renderWidth - TEXT_PADDING * 2 - visibleWidth(preferredAction)),
+      "…",
+    );
+    this.preferredLine.setText(`${this.theme.fg("muted", languagesText)}${preferredAction}`);
+    // States what settings hold right now; the ● marker may run ahead of it
+    // while a selection is still activating.
+    const committed = this.models.find((model) => model.id === this.committedModelId);
+    this.currentLine.setText(
+      `${this.theme.fg("muted", "Current: ")}${committed ? committed.name : this.theme.fg("muted", "none yet")}`,
+    );
     this.search.focused = this._focused && this.mode === "models";
 
     if (this.mode === "downloading") {
@@ -484,6 +508,13 @@ export class CatalogModelPicker extends Container implements Focusable {
       );
       this.body.addChild(
         new Text(this.theme.fg("muted", this.downloadStats()), TEXT_PADDING, 0),
+      );
+      this.body.addChild(
+        new Text(
+          this.theme.fg("dim", "Models run locally — audio never leaves this machine."),
+          TEXT_PADDING,
+          0,
+        ),
       );
       this.body.addChild(new Spacer(1));
       this.body.addChild(
@@ -539,10 +570,19 @@ export class CatalogModelPicker extends Container implements Focusable {
     const displayedId = this.displayedModelId();
 
     if (this.filtered.length === 0) {
-      this.list.addChild(new Text(this.theme.fg("muted", "  No matching models"), LIST_PADDING, 0));
+      this.list.addChild(new Text(this.theme.fg("dim", "  No matching models"), LIST_PADDING, 0));
       this.detail.setText("");
     } else {
       const [start, end] = selectedWindow(this.filtered, this.selectedIndex, MAX_VISIBLE_MODELS);
+      const languagesWidth = visibleWidth(this.languageColumns.join(" "));
+      // Everything in a row except the name: Text padding, "→ ● " gutter,
+      // column gaps, the "✓ " cell, the size column, and the ★ column.
+      const overhead =
+        LIST_PADDING * 2 + 4 + 2 + languagesWidth + 2 + 2 + this.modelSizeWidth + 2 + 1;
+      const nameWidth = Math.min(
+        this.modelNameWidth,
+        Math.max(MIN_MODEL_NAME_WIDTH, this.renderWidth - overhead),
+      );
       for (let index = start; index < end; index += 1) {
         const model = this.filtered[index]!;
         const active = index === this.selectedIndex;
@@ -551,25 +591,18 @@ export class CatalogModelPicker extends Container implements Focusable {
         const current = model.id === displayedId
           ? this.theme.fg("accent", "●")
           : " ";
-        const nameText = model.name.padEnd(MODEL_NAME_WIDTH);
+        const nameText = padColumn(model.name, nameWidth);
         const name = active ? this.theme.fg("accent", nameText) : nameText;
-        const sizeText = formatBinarySize(model.size);
-        const downloaded = cached ? ` ${this.theme.fg("success", "✓")}` : "";
-        const sizePadding = " ".repeat(
-          Math.max(0, MODEL_SIZE_WIDTH - visibleWidth(sizeText) - (cached ? 2 : 0)),
-        );
-        const detail = `${this.theme.fg("dim", sizeText)}${downloaded}${sizePadding}`;
-        // Capability markers use fixed columns so rows do not shift. Keep the
-        // recommendation marker first because it is the primary decision aid.
+        // The ✓ has its own column ahead of the right-aligned size, so neither
+        // the mark nor the number shifts with the size's digit count.
+        const check = cached ? `${this.theme.fg("success", "✓")} ` : "  ";
+        const sizeText = formatBinarySize(model.size).padStart(this.modelSizeWidth);
         const recommended = model.recommended
           ? this.theme.fg("accent", "★")
           : " ";
-        const streaming = model.capabilities.streaming
-          ? this.theme.fg("accent", "↯")
-          : " ";
         this.list.addChild(
           new Text(
-            `${prefix}${current} ${name}  ${this.languageMatrix(model)}  ${detail}  ${recommended} ${streaming}`,
+            `${prefix}${current} ${name}  ${this.languageMatrix(model)}  ${check}${this.theme.fg("dim", sizeText)}  ${recommended}`,
             LIST_PADDING,
             0,
           ),
@@ -578,7 +611,7 @@ export class CatalogModelPicker extends Container implements Focusable {
       if (start > 0 || end < this.filtered.length) {
         this.list.addChild(
           new Text(
-            this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filtered.length})`),
+            this.theme.fg("dim", `  (${this.selectedIndex + 1}/${this.filtered.length})`),
             LIST_PADDING,
             0,
           ),
@@ -586,21 +619,18 @@ export class CatalogModelPicker extends Container implements Focusable {
       }
 
       const selected = this.filtered[this.selectedIndex]!;
-      const languageCount = new Set(selected.languages.map(canonicalLanguage)).size;
+      const canonicalLanguages = [...new Set(selected.languages.map(canonicalLanguage))];
       const features = [
-        selected.capabilities.streaming ? "streaming-capable" : undefined,
+        canonicalLanguages.length === 1
+          ? `${displayLanguage(canonicalLanguages[0]!)} only`
+          : `${canonicalLanguages.length} languages`,
         selected.capabilities.languageDetection ? "auto language detection" : undefined,
-        `${languageCount} language${languageCount === 1 ? "" : "s"}`,
-        selected.parameters ?? undefined,
       ].filter((value): value is string => Boolean(value));
-      const availability = this.cachedById.has(selected.id)
-        ? ""
-        : `\n${this.theme.fg("warning", `↓ Not downloaded · ${formatBinarySize(selected.size)} · ${selected.license} · from Hugging Face`)}`;
       const feedback = this.feedback
         ? `\n${this.theme.fg(this.feedback.type, this.feedback.text)}`
         : "";
       this.detail.setText(
-        `${this.theme.fg("muted", selected.description)}\n${this.theme.fg("dim", features.join(" · "))}${availability}${feedback}`,
+        `${selected.description}\n${this.theme.fg("dim", features.join(" · "))}${feedback}`,
       );
     }
 
@@ -613,7 +643,6 @@ export class CatalogModelPicker extends Container implements Focusable {
         : undefined,
       `${this.theme.fg("success", "✓")} ${this.theme.fg("dim", "downloaded")}`,
       `${this.theme.fg("accent", "★")} ${this.theme.fg("dim", "recommended")}`,
-      `${this.theme.fg("accent", "↯")} ${this.theme.fg("dim", "streaming")}`,
     ]
       .filter((value): value is string => Boolean(value))
       .join("  ");

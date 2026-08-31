@@ -10,7 +10,7 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { CatalogModelPicker } from "../src/model-picker.js";
-import type { CatalogModel } from "../src/catalog.js";
+import { CATALOG_MODELS, type CatalogModel } from "../src/catalog.js";
 
 initTheme("dark");
 
@@ -95,8 +95,8 @@ test("enter on an uncached model starts the download immediately", (t) => {
   const { picker, internals, progress } = controlledPicker();
   t.after(() => picker.dispose());
   const body = rendered(picker);
-  // The detail pane states the download status, the footer the action.
-  assert.match(body, /↓ Not downloaded · \d.* from Hugging Face/);
+  // The detail pane carries the model facts; the footer carries the action.
+  assert.match(body, /English only|\d+ languages/);
   assert.match(body, /enter.*download \d/);
 
   picker.handleInput(ENTER);
@@ -183,5 +183,38 @@ test("a finished download reports success and marks the model downloaded", async
   assert.equal(internals.mode, "models");
   const body = rendered(picker);
   assert.match(body, /✓ Downloaded and selected /);
+  assert.match(body, /Current: /);
   assert.ok(internals.cachedById.size > 0);
 });
+
+test("size and downloaded columns stay aligned and rows never wrap", (t) => {
+  const { picker, internals } = controlledPicker();
+  t.after(() => picker.dispose());
+  const byName = new Map(CATALOG_MODELS.map((model) => [model.name, model]));
+  // Cached sizes spanning 2-3 digits and MiB/GiB so misalignment would show.
+  for (const name of ["Moonshine Streaming Tiny", "Parakeet Unified EN 0.6B", "Voxtral Small 24B"]) {
+    internals.cachedById.set(byName.get(name)!.id, { path: "x" });
+  }
+  internals.refresh();
+  const strip = (line: string) => line.replace(/\u001b\[[0-9;]*m/g, "");
+  for (const width of [80, 100]) {
+    const lines = picker.render(width).map(strip);
+    const rows = lines.filter((line) => / [MG]iB/.test(line) && !/·|download/.test(line));
+    // Ten visible models, each on a single unwrapped line.
+    assert.equal(rows.length, 10, `model rows at width ${width}`);
+    const checkColumns = new Set(
+      rows.filter((line) => line.includes("✓")).map((line) => line.indexOf("✓")),
+    );
+    assert.equal(checkColumns.size, 1, `✓ column drifts at width ${width}`);
+    // Sizes are right-aligned: every size ends at the same column.
+    const sizeEnds = new Set(rows.map((line) => line.search(/ [MG]iB/) + 4));
+    assert.equal(sizeEnds.size, 1, `size column drifts at width ${width}`);
+    for (const line of lines) {
+      assert.ok(visibleLength(line) <= width, `overflowing line at width ${width}: ${line}`);
+    }
+  }
+});
+
+function visibleLength(line: string): number {
+  return line.replace(/\u001b\[[0-9;]*m/g, "").length;
+}

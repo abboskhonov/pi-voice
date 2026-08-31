@@ -459,7 +459,7 @@ export async function showSettingsMenu(
         id: "model",
         label: "Model",
         currentValue: model.name,
-        description: "Local speech-recognition model; ↯ marks streaming-capable models",
+        description: "Local speech-recognition model; audio never leaves this machine",
         submenu: (_currentValue, close) =>
           new ModelSettingsSubmenu(
             ctx,
