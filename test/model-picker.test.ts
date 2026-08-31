@@ -138,10 +138,12 @@ test("download stats include a rolling speed and ETA", (t) => {
   t.after(() => picker.dispose());
   picker.handleInput(ENTER);
   progress(1_000_000_000, 3_000_000_000);
-  // Spread the samples 5s apart so the speed estimate becomes available.
+  // Spread the samples 4s apart: wide enough for a speed estimate, with a
+  // second of slack inside the 5s window so wall-clock time elapsing before
+  // the next refresh cannot age the first sample out on a slow CI runner.
   const now = Date.now();
   internals.downloadSamples = [
-    { t: now - 5000, bytes: 500_000_000 },
+    { t: now - 4000, bytes: 600_000_000 },
     { t: now, bytes: 1_000_000_000 },
   ];
   // A further progress event refreshes the stats line from those samples.
