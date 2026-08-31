@@ -188,16 +188,13 @@ export async function downloadCatalogModel(
     if (body) {
       let lastReport = 0;
       const file = await open(partialPath, resume ? "a" : "w");
-      // One write stays in flight while the next chunk is read from the
-      // network, so disk and network overlap; writes are still issued one at
-      // a time and in order.
-      let pending: Promise<unknown> = Promise.resolve();
       try {
         for await (const value of body) {
           signal?.throwIfAborted();
           const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-          await pending;
-          pending = file.writeFile(chunk);
+          // Await each write so any later abort or stream error leaves a clean,
+          // fully written prefix that can safely be resumed.
+          await file.writeFile(chunk);
           downloaded += chunk.length;
           digest.update(chunk);
           const now = Date.now();
@@ -206,20 +203,17 @@ export async function downloadCatalogModel(
             onProgress?.({ downloaded, total: model.size });
           }
         }
-        await pending;
       } finally {
-        // Swallow here so an abort exiting the loop does not turn the
-        // in-flight write's rejection into an unhandled one; close() waits
-        // for pending operations, so interrupted transfers still keep every
-        // chunk handed to the file.
-        await pending.catch(() => undefined);
         await file.close();
       }
     }
     signal?.throwIfAborted();
 
     const written = await stat(partialPath);
-    if (written.size !== model.size || digest.digest("hex") !== model.sha256) {
+    if (written.size < model.size) {
+      throw new Error(`${model.name} download ended early; partial bytes were kept`);
+    }
+    if (written.size > model.size || digest.digest("hex") !== model.sha256) {
       await rm(partialPath, { force: true });
       throw new Error(`${model.name} verification failed; incomplete bytes were removed`);
     }

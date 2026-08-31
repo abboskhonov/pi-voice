@@ -42,6 +42,8 @@ function fakeHub(options: {
   honorRanges?: boolean;
   /** Error the stream once after serving this many payload bytes. */
   failAfter?: number;
+  /** End the stream cleanly after serving this many payload bytes. */
+  endAfter?: number;
   /** Observe cumulative payload bytes; used to abort deterministically. */
   onServed?: (total: number) => void;
   /** Respond to resume range requests with this HTTP status and no body. */
@@ -84,6 +86,10 @@ function fakeHub(options: {
           controller.error(new Error("connection reset"));
           return;
         }
+        if (options.endAfter !== undefined && served >= options.endAfter) {
+          controller.close();
+          return;
+        }
         if (offset >= payload.length) {
           controller.close();
           return;
@@ -116,7 +122,8 @@ async function withCacheDirectory(run: () => Promise<void>): Promise<void> {
   try {
     await run();
   } finally {
-    process.env.HF_HUB_CACHE = previous;
+    if (previous === undefined) delete process.env.HF_HUB_CACHE;
+    else process.env.HF_HUB_CACHE = previous;
     await rm(cacheDirectory, { recursive: true, force: true });
   }
 }
@@ -160,13 +167,16 @@ test("an interrupted download keeps a resumable partial and resumes with a range
     assert.equal(findIncompleteDownload(model), undefined);
   }));
 
-test("a dropped connection keeps the partial for the next attempt", () =>
+test("an early EOF keeps the partial for the next attempt", () =>
   withCacheDirectory(async () => {
     const data = testData(256 * 1024);
     const model = testModel(data);
 
-    const flaky = fakeHub({ data, failAfter: 100_000 });
-    await assert.rejects(downloadCatalogModel(model, { fetch: flaky.fetchImpl }));
+    const truncated = fakeHub({ data, endAfter: 100_000 });
+    await assert.rejects(
+      downloadCatalogModel(model, { fetch: truncated.fetchImpl }),
+      /ended early/,
+    );
     const partial = findIncompleteDownload(model);
     assert.ok(partial && partial.bytes > 0);
 
