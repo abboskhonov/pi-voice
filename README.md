@@ -18,7 +18,7 @@ The extension registers:
 
 - a configurable terminal shortcut (`Ctrl+Alt+Z` by default) to start and stop recording;
 - a `transcribe_file` tool that the agent can use to transcribe local audio or video files;
-- `/voice` for preferred languages, model, transcription language, microphone, and shortcut settings.
+- `/voice` for preferred languages, model, transcription language, microphone, and shortcut settings; run `/voice stats` for dictated-word totals today, this month, and all time.
 
 To develop or run it from a checkout:
 

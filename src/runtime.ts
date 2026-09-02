@@ -29,6 +29,7 @@ export type PiVoiceRuntime = {
   toggleCapture(ctx: ExtensionContext): Promise<void>;
   showSettings(ctx: ExtensionCommandContext): Promise<void>;
   replayOnboarding(ctx: ExtensionCommandContext): Promise<void>;
+  showStats(ctx: ExtensionCommandContext): Promise<void>;
   shutdown(ctx: ExtensionContext): Promise<void>;
 };
 
@@ -156,6 +157,11 @@ export function createPiVoiceRuntime(
     return configured;
   }
 
+  async function showStats(ctx: ExtensionCommandContext): Promise<void> {
+    const { createVoiceStatsStore, formatVoiceStats } = await import("./voice-stats.js");
+    ctx.ui.notify(formatVoiceStats(await createVoiceStatsStore().summary()), "info");
+  }
+
   async function requireConfiguredSettingsForTool(): Promise<TranscribeSettings> {
     await loadSettingsOnce();
     if (settingsReadWarning) {
@@ -245,6 +251,12 @@ export function createPiVoiceRuntime(
         const seconds = pcm.length / CAPTURE_SAMPLE_RATE;
 
         if (text) {
+          try {
+            const { createVoiceStatsStore } = await import("./voice-stats.js");
+            await createVoiceStatsStore().addTranscript(text);
+          } catch {
+            ctx.ui.notify("Transcript saved, but voice stats could not be updated", "warning");
+          }
           ctx.ui.pasteToEditor(text);
           ctx.ui.notify(`Transcribed ${seconds.toFixed(1)}s of audio`, "info");
         } else {
@@ -463,6 +475,7 @@ export function createPiVoiceRuntime(
     toggleCapture,
     showSettings,
     replayOnboarding,
+    showStats,
     shutdown,
   };
 }

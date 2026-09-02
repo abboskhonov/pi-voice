@@ -55,7 +55,11 @@ export default function piVoice(pi: ExtensionAPI): void {
 
   pi.registerCommand("voice", {
     description: "Open pi-voice settings",
-    handler: async (_args, ctx) => (await loadRuntime()).showSettings(ctx),
+    handler: async (args, ctx) => {
+      const runtime = await loadRuntime();
+      if (args.trim() === "stats") return runtime.showStats(ctx);
+      return runtime.showSettings(ctx);
+    },
   });
 
   if (process.env.PI_VOICE_DEBUG === "1") {
