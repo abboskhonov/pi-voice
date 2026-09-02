@@ -1,6 +1,6 @@
 import {
-  DynamicBorder,
   keyHint,
+  keyText,
   rawKeyHint,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -11,6 +11,7 @@ import {
   fuzzyFilter,
   Input,
   Key,
+  Loader,
   matchesKey,
   Spacer,
   Text,
@@ -30,28 +31,46 @@ import {
   rankCatalogModels,
   type CatalogModel,
 } from "./catalog.js";
-import { findCachedCatalogModel, type CachedCatalogModel } from "./models.js";
+import {
+  findCachedCatalogModel,
+  findIncompleteDownload,
+  type CachedCatalogModel,
+} from "./models.js";
 import type { TranscriptionLanguage } from "./settings.js";
+import {
+  LIST_PADDING,
+  MIN_VISIBLE_ROWS,
+  PANEL_PADDING,
+  padToWidth,
+  panelBorder,
+  paneRowBudget,
+  selectedWindow,
+  SingleSelectPicker,
+  windowSizeForBudget,
+  type SingleSelectChoice,
+} from "./ui-components.js";
 
 type UiTheme = ExtensionContext["ui"]["theme"];
 
 const MAX_VISIBLE_LANGUAGES = 9;
 const MAX_VISIBLE_MODELS = 10;
-// List rows render as margin(1) + cursor gutter ("→ ") + content, so content
-// starts at column 3. Headers, search, and footers pad to that same column and
-// the cursor arrow hangs in the gutter to their left.
-const LIST_PADDING = 1;
-const TEXT_PADDING = 3;
+const DOWNLOAD_BAR_WIDTH = 36;
+// Rolling window for the download speed estimate.
+const SPEED_WINDOW_MS = 5000;
+
+function formatEta(seconds: number): string {
+  if (seconds < 90) return `~${Math.max(1, Math.round(seconds))}s left`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `~${minutes} min left`;
+  const hours = Math.floor(minutes / 60);
+  return `~${hours} h ${minutes % 60} min left`;
+}
+const TEXT_PADDING = PANEL_PADDING;
 // Longest catalog language name is "Norwegian Nynorsk" (17).
 const LANGUAGE_NAME_WIDTH = 20;
-const MODEL_NAME_WIDTH = 34;
-const MODEL_SIZE_WIDTH = 11;
+// Below this the name column stops shrinking and rows are left to wrap.
+const MIN_MODEL_NAME_WIDTH = 12;
 const TRANSCRIPTION_LANGUAGE_NAME_WIDTH = 28;
-
-function padColumn(value: string, width: number): string {
-  const truncated = truncateToWidth(value, width, "…");
-  return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
-}
 
 function transcriptionLanguageName(
   language: string,
@@ -64,21 +83,13 @@ function transcriptionLanguageName(
   return displayLanguage(variants.length > 1 ? language : base);
 }
 
-function selectedWindow<T>(items: readonly T[], selected: number, maximum: number): [number, number] {
-  const start = Math.max(
-    0,
-    Math.min(selected - Math.floor(maximum / 2), items.length - maximum),
-  );
-  return [start, Math.min(start + maximum, items.length)];
-}
-
 export type LanguageSelection = {
   languages: string[];
   /** False when the picker was closed with Esc instead of Continue. */
   confirmed: boolean;
 };
 
-class LanguagePicker extends Container implements Focusable {
+export class LanguagePicker extends Container implements Focusable {
   private readonly search = new Input();
   private readonly list = new Container();
   private readonly footer = new Text("", TEXT_PADDING, 0);
@@ -86,6 +97,8 @@ class LanguagePicker extends Container implements Focusable {
   private ordered: string[] = [];
   private filtered: string[] = [];
   private selectedIndex = 0;
+  /** Scroll-window rows (rule included); shrinks to fit short terminals. */
+  private windowRows = MAX_VISIBLE_LANGUAGES + 1;
   private _focused = false;
 
   get focused(): boolean {
@@ -112,7 +125,7 @@ class LanguagePicker extends Container implements Focusable {
     );
     this.reorder();
 
-    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    this.addChild(panelBorder(theme));
     this.addChild(new Spacer(1));
     this.addChild(
       new Text(theme.fg("accent", theme.bold("Select the languages you speak")), TEXT_PADDING, 0),
@@ -135,7 +148,7 @@ class LanguagePicker extends Container implements Focusable {
     this.addChild(new Spacer(1));
     this.addChild(this.footer);
     this.addChild(new Spacer(1));
-    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    this.addChild(panelBorder(theme));
     this.refresh();
   }
 
@@ -188,8 +201,9 @@ class LanguagePicker extends Container implements Focusable {
         boundary >= 0 && this.selectedIndex >= boundary
           ? this.selectedIndex + 1
           : this.selectedIndex;
-      // +1 so the window holds the same line count with or without the rule.
-      const [start, end] = selectedWindow(rows, cursorRow, MAX_VISIBLE_LANGUAGES + 1);
+      // Sized +1 so the window holds the same line count with or without the
+      // rule row.
+      const [start, end] = selectedWindow(rows, cursorRow, this.windowRows);
       for (let index = start; index < end; index += 1) {
         const language = rows[index]!;
         if (language === null) {
@@ -202,7 +216,7 @@ class LanguagePicker extends Container implements Focusable {
         const checked = this.selected.has(language);
         const prefix = active ? this.theme.fg("accent", "→ ") : "  ";
         const mark = checked ? this.theme.fg("success", "[×]") : this.theme.fg("dim", "[ ]");
-        const name = padColumn(displayLanguage(language), LANGUAGE_NAME_WIDTH);
+        const name = padToWidth(displayLanguage(language), LANGUAGE_NAME_WIDTH);
         this.list.addChild(
           new Text(
             `${prefix}${mark} ${active ? this.theme.fg("accent", name) : name}${this.theme.fg("dim", language)}`,
@@ -216,12 +230,13 @@ class LanguagePicker extends Container implements Focusable {
     const selected = this.selectedLanguages();
     const onContinue = this.selectedIndex === this.continueRowIndex();
     const continuePrefix = onContinue ? this.theme.fg("accent", "→ ") : "  ";
+    const continueAction = ` ${keyText("tui.input.tab")}  Continue `;
     const continueRow = selected.length === 0
       ? this.theme.fg("warning", "Select at least one language to continue")
       : this.theme.inverse(
           onContinue
-            ? this.theme.fg("accent", this.theme.bold(" tab  Continue "))
-            : this.theme.fg("success", " tab  Continue "),
+            ? this.theme.fg("accent", this.theme.bold(continueAction))
+            : this.theme.fg("success", continueAction),
         );
     this.list.addChild(new Spacer(1));
     this.list.addChild(new Text(`${continuePrefix}${continueRow}`, LIST_PADDING, 0));
@@ -245,6 +260,28 @@ class LanguagePicker extends Container implements Focusable {
     // group; on deselect stay put — trailing the language to its new spot far
     // down the list is disorienting.
     this.refresh(adding ? language : undefined);
+  }
+
+  // The pane replaces the host editor and cannot scroll: when the terminal is
+  // short, shrink the window so the title, Continue row, and footer stay on
+  // screen.
+  override render(width: number): string[] {
+    const budget = paneRowBudget(this.tui);
+    if (budget !== undefined) {
+      const chrome = super.render(width).length - this.list.render(width).length;
+      // The spacer and Continue row live inside the list; the scroll window
+      // gets the rest, still +1 sized for the rule row.
+      const rows = windowSizeForBudget(
+        budget - chrome - 2,
+        MAX_VISIBLE_LANGUAGES + 1,
+        MIN_VISIBLE_ROWS + 1,
+      );
+      if (rows !== this.windowRows) {
+        this.windowRows = rows;
+        this.refresh();
+      }
+    }
+    return super.render(width);
   }
 
   handleInput(data: string): void {
@@ -301,11 +338,20 @@ class LanguagePicker extends Container implements Focusable {
   }
 }
 
-type CatalogModelPickerResult =
+export type CatalogModelPickerResult =
   | { type: "change-languages" }
   | { type: "complete" };
 
-type CatalogModelActivation = (
+export type CatalogModelPostActivation = "stay" | "advance";
+
+export type CatalogModelPickerOptions = {
+  /** What the host does after activation and its settings commit succeed. */
+  postActivation?: CatalogModelPostActivation;
+  /** The host is reopening this picker after an activation in the same flow. */
+  activatedInFlow?: boolean;
+};
+
+export type CatalogModelActivation = (
   model: CatalogModel,
   options: {
     cached: CachedCatalogModel | undefined;
@@ -314,9 +360,9 @@ type CatalogModelActivation = (
   },
 ) => Promise<{ path: string }>;
 
-type CatalogModelPickerMode = "models" | "confirm-download" | "downloading";
+type CatalogModelPickerMode = "models" | "downloading";
 
-class CatalogModelPicker extends Container implements Focusable {
+export class CatalogModelPicker extends Container implements Focusable {
   private readonly search = new Input();
   private readonly searchBox = new Box(LIST_PADDING, 0);
   private readonly body = new Container();
@@ -327,19 +373,28 @@ class CatalogModelPicker extends Container implements Focusable {
   private readonly cachedById = new Map<string, CachedCatalogModel>();
   private readonly models: CatalogModel[];
   private readonly languageColumns: readonly string[];
+  /** Widest model name / formatted size in the catalog; column ceilings. */
+  private readonly modelNameWidth: number;
+  private readonly modelSizeWidth: number;
+  /** Width of the last render; row columns are laid out against it. */
+  private renderWidth = 80;
+  /** Rows the model window may use; shrinks to fit short terminals. */
+  private visibleModels = MAX_VISIBLE_MODELS;
   private filtered: CatalogModel[] = [];
   private selectedIndex = 0;
   /** Last selection whose activation finished; what settings actually hold. */
   private committedModelId: string | undefined;
   private mode: CatalogModelPickerMode = "models";
-  /** Model awaiting the download confirmation prompt. */
-  private pendingModel: CatalogModel | undefined;
+  private readonly postActivation: CatalogModelPostActivation;
   /** Latest selection still activating; a newer selection supersedes it. */
   private target: { model: CatalogModel; controller: AbortController } | undefined;
   /** Exit requested while a save was in flight; fires when the save lands. */
   private pendingExit: { result: CatalogModelPickerResult | undefined } | undefined;
-  private downloadMessage = "";
-  private feedback: { type: "success" | "error"; text: string } | undefined;
+  private downloadBytes = 0;
+  private downloadTotal = 0;
+  private downloadSamples: { t: number; bytes: number }[] = [];
+  private downloadSpinner: Loader | undefined;
+  private feedback: { type: "success" | "error" | "muted"; text: string } | undefined;
   private selectedDuringSession = false;
   private disposed = false;
   private _focused = false;
@@ -361,12 +416,12 @@ class CatalogModelPicker extends Container implements Focusable {
     currentModelId: string | undefined,
     private readonly done: (result: CatalogModelPickerResult | undefined) => void,
     private readonly onActivate: CatalogModelActivation,
-    private readonly continueAfterActivation = false,
-    alreadyActivated = false,
+    options: CatalogModelPickerOptions = {},
   ) {
     super();
     this.committedModelId = currentModelId;
-    this.selectedDuringSession = alreadyActivated;
+    this.postActivation = options.postActivation ?? "stay";
+    this.selectedDuringSession = options.activatedInFlow ?? false;
     for (const model of CATALOG_MODELS) {
       const cached = findCachedCatalogModel(model);
       if (cached) this.cachedById.set(model.id, cached);
@@ -383,14 +438,21 @@ class CatalogModelPicker extends Container implements Focusable {
       if (current) this.models.unshift(current);
     }
 
+    this.modelNameWidth = Math.max(
+      ...this.models.map((model) => visibleWidth(model.name)),
+    );
+    this.modelSizeWidth = Math.max(
+      ...this.models.map((model) => visibleWidth(formatBinarySize(model.size))),
+    );
+
     this.searchBox.addChild(this.search);
-    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    this.addChild(panelBorder(theme));
     this.addChild(new Spacer(1));
     this.addChild(new Text(theme.fg("accent", theme.bold("Choose a transcription model")), TEXT_PADDING, 0));
     this.addChild(this.preferredLine);
     this.addChild(this.body);
     this.addChild(new Spacer(1));
-    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    this.addChild(panelBorder(theme));
 
     this.refresh();
   }
@@ -413,54 +475,53 @@ class CatalogModelPicker extends Container implements Focusable {
     return this.target?.model.id ?? this.committedModelId;
   }
 
+  // Column widths depend on the terminal: relay out when the width changes so
+  // rows truncate their name column instead of wrapping onto a second line.
+  // Short terminals also shrink the list window so the title, Languages line,
+  // detail, and footer stay on screen; the downloading panel is short enough
+  // to be exempt.
+  override render(width: number): string[] {
+    if (width !== this.renderWidth) {
+      this.renderWidth = width;
+      this.refresh();
+    }
+    const budget = this.mode === "models" ? paneRowBudget(this.tui) : undefined;
+    if (budget !== undefined) {
+      const total = super.render(width).length;
+      const detailLines = this.detail.render(width).length;
+      const chrome =
+        total - this.list.render(width).length - detailLines + this.detailReserve(width);
+      const visible = windowSizeForBudget(budget - chrome, MAX_VISIBLE_MODELS);
+      if (visible !== this.visibleModels) {
+        this.visibleModels = visible;
+        this.refresh();
+      }
+    }
+    return super.render(width);
+  }
+
+  // The description is truncated to one line, so only transient feedback can
+  // change the detail height; reserving for it keeps the window steady.
+  private detailReserve(width: number): number {
+    const feedbackLines = this.feedback
+      ? new Text(this.feedback.text, TEXT_PADDING, 0).render(width).length
+      : 0;
+    // One description line plus the features line.
+    return 2 + feedbackLines;
+  }
+
   private refresh(): void {
     this.body.clear();
-    const preferred = this.theme.fg(
-      "muted",
-      `Preferred: ${this.preferredLanguages.map(displayLanguage).join(", ")}`,
-    );
     const preferredAction = this.selectedDuringSession
-      ? this.continueAfterActivation
-        ? ` · ${keyHint("tui.input.tab", "continue")}`
-        : ""
+      ? ""
       : ` · ${keyHint("tui.input.tab", "change")}`;
-    this.preferredLine.setText(`${preferred}${preferredAction}`);
+    const languagesText = truncateToWidth(
+      `Languages: ${this.preferredLanguages.map(displayLanguage).join(", ")}`,
+      Math.max(24, this.renderWidth - TEXT_PADDING * 2 - visibleWidth(preferredAction)),
+      "…",
+    );
+    this.preferredLine.setText(`${this.theme.fg("muted", languagesText)}${preferredAction}`);
     this.search.focused = this._focused && this.mode === "models";
-
-    if (this.mode === "confirm-download") {
-      const model = this.pendingModel!;
-      this.body.addChild(new Spacer(1));
-      this.body.addChild(new Text(this.theme.bold(model.name), TEXT_PADDING, 0));
-      this.body.addChild(
-        new Text(
-          [
-            `Download ${formatBinarySize(model.size)} from Hugging Face?`,
-            `License: ${model.license}`,
-            "Audio never leaves this machine.",
-          ].join("\n"),
-          TEXT_PADDING,
-          0,
-        ),
-      );
-      this.body.addChild(new Spacer(1));
-      this.body.addChild(
-        new Text(
-          `${keyHint("tui.select.confirm", "download")}  ${keyHint("tui.select.cancel", "back")}`,
-          TEXT_PADDING,
-          0,
-        ),
-      );
-      // An earlier selection can fail while this prompt is open; surface it
-      // here instead of holding it for the list view.
-      if (this.feedback) {
-        this.body.addChild(new Spacer(1));
-        this.body.addChild(
-          new Text(this.theme.fg(this.feedback.type, this.feedback.text), TEXT_PADDING, 0),
-        );
-      }
-      this.tui.requestRender();
-      return;
-    }
 
     if (this.mode === "downloading") {
       const model = this.target!.model;
@@ -472,10 +533,33 @@ class CatalogModelPicker extends Container implements Focusable {
           0,
         ),
       );
-      this.body.addChild(new Text(this.theme.fg("muted", this.downloadMessage), TEXT_PADDING, 0));
+      // The spinner keeps animating even when the connection stalls, so a
+      // stuck download never reads as a frozen UI.
+      if (this.downloadSpinner) this.body.addChild(this.downloadSpinner);
+      const ratio =
+        this.downloadTotal > 0
+          ? Math.min(1, this.downloadBytes / this.downloadTotal)
+          : 0;
+      const filled = Math.round(ratio * DOWNLOAD_BAR_WIDTH);
+      const bar = `${this.theme.fg("accent", "█".repeat(filled))}${this.theme.fg("dim", "─".repeat(DOWNLOAD_BAR_WIDTH - filled))}`;
+      const percent =
+        this.downloadTotal > 0 ? ` ${Math.floor(ratio * 100)}%` : "";
+      this.body.addChild(
+        new Text(`${bar}${this.theme.fg("dim", percent)}`, TEXT_PADDING, 0),
+      );
+      this.body.addChild(
+        new Text(this.theme.fg("muted", this.downloadStats()), TEXT_PADDING, 0),
+      );
+      this.body.addChild(
+        new Text(
+          this.theme.fg("dim", "Models run locally — audio never leaves this machine."),
+          TEXT_PADDING,
+          0,
+        ),
+      );
       this.body.addChild(new Spacer(1));
       this.body.addChild(
-        new Text(keyHint("tui.select.cancel", "cancel"), TEXT_PADDING, 0),
+        new Text(keyHint("tui.select.cancel", "stop (keeps progress)"), TEXT_PADDING, 0),
       );
       this.tui.requestRender();
       return;
@@ -499,10 +583,19 @@ class CatalogModelPicker extends Container implements Focusable {
     const displayedId = this.displayedModelId();
 
     if (this.filtered.length === 0) {
-      this.list.addChild(new Text(this.theme.fg("muted", "  No matching models"), LIST_PADDING, 0));
+      this.list.addChild(new Text(this.theme.fg("dim", "  No matching models"), LIST_PADDING, 0));
       this.detail.setText("");
     } else {
-      const [start, end] = selectedWindow(this.filtered, this.selectedIndex, MAX_VISIBLE_MODELS);
+      const [start, end] = selectedWindow(this.filtered, this.selectedIndex, this.visibleModels);
+      const languagesWidth = visibleWidth(this.languageColumns.join(" "));
+      // Everything in a row except the name: Text padding, "→ ● " gutter,
+      // column gaps, the "✓ " cell, the size column, and the ★ column.
+      const overhead =
+        LIST_PADDING * 2 + 4 + 2 + languagesWidth + 2 + 2 + this.modelSizeWidth + 2 + 1;
+      const nameWidth = Math.min(
+        this.modelNameWidth,
+        Math.max(MIN_MODEL_NAME_WIDTH, this.renderWidth - overhead),
+      );
       for (let index = start; index < end; index += 1) {
         const model = this.filtered[index]!;
         const active = index === this.selectedIndex;
@@ -511,69 +604,106 @@ class CatalogModelPicker extends Container implements Focusable {
         const current = model.id === displayedId
           ? this.theme.fg("accent", "●")
           : " ";
-        const nameText = model.name.padEnd(MODEL_NAME_WIDTH);
+        const nameText = padToWidth(model.name, nameWidth);
         const name = active ? this.theme.fg("accent", nameText) : nameText;
-        const sizeText = formatBinarySize(model.size);
-        const downloaded = cached ? ` ${this.theme.fg("success", "✓")}` : "";
-        const sizePadding = " ".repeat(
-          Math.max(0, MODEL_SIZE_WIDTH - visibleWidth(sizeText) - (cached ? 2 : 0)),
-        );
-        const detail = `${this.theme.fg("dim", sizeText)}${downloaded}${sizePadding}`;
+        // The ✓ has its own column ahead of the right-aligned size, so neither
+        // the mark nor the number shifts with the size's digit count.
+        const check = cached ? `${this.theme.fg("success", "✓")} ` : "  ";
+        const sizeText = formatBinarySize(model.size).padStart(this.modelSizeWidth);
         const recommended = model.recommended
-          ? `  ${this.theme.fg("accent", "recommended")}`
-          : "";
+          ? this.theme.fg("accent", "★")
+          : " ";
         this.list.addChild(
           new Text(
-            `${prefix}${current} ${name}  ${this.languageMatrix(model)}  ${detail}${recommended}`,
+            `${prefix}${current} ${name}  ${this.languageMatrix(model)}  ${check}${this.theme.fg("dim", sizeText)}  ${recommended}`,
             LIST_PADDING,
             0,
           ),
         );
       }
-      if (start > 0 || end < this.filtered.length) {
-        this.list.addChild(
-          new Text(
-            this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filtered.length})`),
-            LIST_PADDING,
-            0,
-          ),
-        );
-      }
-
       const selected = this.filtered[this.selectedIndex]!;
-      const languageCount = new Set(selected.languages.map(canonicalLanguage)).size;
+      const canonicalLanguages = [...new Set(selected.languages.map(canonicalLanguage))];
       const features = [
+        canonicalLanguages.length === 1
+          ? `${displayLanguage(canonicalLanguages[0]!)} only`
+          : `${canonicalLanguages.length} languages`,
         selected.capabilities.languageDetection ? "auto language detection" : undefined,
-        `${languageCount} language${languageCount === 1 ? "" : "s"}`,
-        selected.parameters ?? undefined,
       ].filter((value): value is string => Boolean(value));
       const feedback = this.feedback
         ? `\n${this.theme.fg(this.feedback.type, this.feedback.text)}`
         : "";
+      // One line: the features line below already carries the capabilities a
+      // long description would wrap for.
+      const description = truncateToWidth(
+        selected.description,
+        Math.max(24, this.renderWidth - TEXT_PADDING * 2),
+        "…",
+      );
       this.detail.setText(
-        `${this.theme.fg("muted", selected.description)}\n${this.theme.fg("dim", features.join(" · "))}${feedback}`,
+        `${description}\n${this.theme.fg("dim", features.join(" · "))}${feedback}`,
       );
     }
 
+    // The scroll position lives in this count, so the list never spends a
+    // row on an indicator.
     const shown = query
-      ? `${this.filtered.length}/${this.models.length} matching models`
-      : `${this.models.length} models`;
+      ? this.filtered.length === 0
+        ? `0/${this.models.length} matching models`
+        : `${this.selectedIndex + 1}/${this.filtered.length} matching models`
+      : `${this.selectedIndex + 1}/${this.models.length} models`;
     const statusLegend = [
       displayedId
         ? `${this.theme.fg("accent", "●")} ${this.theme.fg("dim", "current")}`
         : undefined,
       `${this.theme.fg("success", "✓")} ${this.theme.fg("dim", "downloaded")}`,
+      `${this.theme.fg("accent", "★")} ${this.theme.fg("dim", "recommended")}`,
     ]
       .filter((value): value is string => Boolean(value))
       .join("  ");
-    const continueHint = this.selectedDuringSession && this.continueAfterActivation
-      ? `  ${keyHint("tui.input.tab", "continue")}`
-      : "";
     const closeLabel = query ? "clear search" : this.selectedDuringSession ? "back" : "cancel";
+    // The confirm key says what it will do for the highlighted model.
+    const highlighted = this.filtered[this.selectedIndex];
+    const confirmLabel = highlighted && !this.cachedById.has(highlighted.id)
+      ? findIncompleteDownload(highlighted)
+        ? "resume download"
+        : `download ${formatBinarySize(highlighted.size)}`
+      : "choose";
     this.footer.setText(
-      `${this.theme.fg("dim", shown)}  ${statusLegend}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "choose")}${continueHint}  ${keyHint("tui.select.cancel", closeLabel)}`,
+      `${this.theme.fg("dim", shown)}  ${statusLegend}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", confirmLabel)}  ${keyHint("tui.select.cancel", closeLabel)}`,
     );
     this.tui.requestRender();
+  }
+
+  private downloadSpeed(): number | undefined {
+    const now = Date.now();
+    this.downloadSamples = this.downloadSamples.filter(
+      (sample) => now - sample.t <= SPEED_WINDOW_MS,
+    );
+    if (this.downloadSamples.length < 2) return undefined;
+    const first = this.downloadSamples[0]!;
+    const last = this.downloadSamples[this.downloadSamples.length - 1]!;
+    const elapsed = last.t - first.t;
+    if (elapsed < 500) return undefined;
+    return ((last.bytes - first.bytes) / elapsed) * 1000;
+  }
+
+  private downloadStats(): string {
+    if (this.downloadTotal === 0) return "Preparing download…";
+    const parts = [
+      `${formatBinarySize(this.downloadBytes)} / ${formatBinarySize(this.downloadTotal)}`,
+    ];
+    const speed = this.downloadSpeed();
+    if (speed !== undefined && speed > 0) {
+      parts.push(`${formatBinarySize(speed)}/s`);
+      const remaining = (this.downloadTotal - this.downloadBytes) / speed;
+      if (remaining > 1) parts.push(formatEta(remaining));
+    }
+    return parts.join(" · ");
+  }
+
+  private stopSpinner(): void {
+    this.downloadSpinner?.stop();
+    this.downloadSpinner = undefined;
   }
 
   // Exit keys wait for an in-flight save (milliseconds): success closes as
@@ -586,17 +716,29 @@ class CatalogModelPicker extends Container implements Focusable {
     this.done(result);
   }
 
+  private applyPostActivation(model: CatalogModel, wasCached: boolean): void {
+    if (this.postActivation === "advance") {
+      this.done({ type: "complete" });
+      return;
+    }
+    this.mode = "models";
+    this.feedback = wasCached
+      ? undefined
+      : { type: "success", text: `✓ Downloaded and selected ${model.name}` };
+    this.refresh();
+  }
+
   private startActivation(model: CatalogModel): void {
     const cached = this.cachedById.get(model.id);
-    // Re-selecting the active model is a no-op unless an activation is still
-    // needed to unlock the "continue" affordance.
+    // A committed model needs no further activation. Apply this host's policy:
+    // settings stay in the picker, while onboarding advances immediately.
     if (
       model.id === this.displayedModelId() &&
       cached &&
-      (this.selectedDuringSession || !this.continueAfterActivation)
+      (this.selectedDuringSession || this.postActivation === "stay")
     ) {
-      this.feedback = undefined;
-      this.refresh();
+      this.selectedDuringSession = true;
+      this.applyPostActivation(model, true);
       return;
     }
 
@@ -607,11 +749,19 @@ class CatalogModelPicker extends Container implements Focusable {
     const controller = new AbortController();
     const activation = { model, controller };
     this.target = activation;
-    this.pendingModel = undefined;
     this.feedback = undefined;
     if (!cached) {
       this.mode = "downloading";
-      this.downloadMessage = `${formatBinarySize(0)} / ${formatBinarySize(model.size)} · 0%`;
+      this.downloadBytes = 0;
+      this.downloadTotal = 0;
+      this.downloadSamples = [];
+      this.stopSpinner();
+      this.downloadSpinner = new Loader(
+        this.tui,
+        (text) => this.theme.fg("accent", text),
+        (text) => this.theme.fg("muted", text),
+        "Connecting to Hugging Face…",
+      );
     }
     this.refresh();
 
@@ -620,8 +770,18 @@ class CatalogModelPicker extends Container implements Focusable {
       signal: controller.signal,
       onProgress: ({ downloaded, total }) => {
         if (this.disposed || controller.signal.aborted || this.target !== activation) return;
-        const percent = total > 0 ? Math.floor((downloaded / total) * 100) : 0;
-        this.downloadMessage = `${formatBinarySize(downloaded)} / ${formatBinarySize(total)} · ${percent}%`;
+        const firstReport = this.downloadTotal === 0 && total > 0;
+        this.downloadBytes = downloaded;
+        this.downloadTotal = total;
+        this.downloadSamples.push({ t: Date.now(), bytes: downloaded });
+        if (this.downloadSamples.length > 64) this.downloadSamples.shift();
+        if (firstReport) {
+          this.downloadSpinner?.setMessage(
+            downloaded > 0
+              ? "Resuming download from Hugging Face…"
+              : "Downloading from Hugging Face…",
+          );
+        }
         this.refresh();
       },
     }).then(
@@ -633,13 +793,15 @@ class CatalogModelPicker extends Container implements Focusable {
         this.selectedDuringSession = true;
         if (this.target === activation) {
           this.target = undefined;
-          if (this.mode === "downloading") this.mode = "models";
+          this.stopSpinner();
           const exit = this.pendingExit;
           if (exit) {
             this.pendingExit = undefined;
             this.done(exit.result);
             return;
           }
+          if (!this.disposed) this.applyPostActivation(model, Boolean(cached));
+          return;
         }
         if (!this.disposed) this.refresh();
       },
@@ -650,11 +812,17 @@ class CatalogModelPicker extends Container implements Focusable {
         else this.cachedById.delete(model.id);
         if (this.target === activation) {
           this.target = undefined;
+          this.stopSpinner();
           // A requested exit is cancelled so the failure stays visible.
           this.pendingExit = undefined;
-          if (this.mode === "downloading") this.mode = "models";
+          this.mode = "models";
           this.feedback = controller.signal.aborted
-            ? undefined
+            ? {
+                type: "muted",
+                text: this.downloadBytes > 0
+                  ? "Download stopped — progress saved. Select the model again to resume."
+                  : "Download stopped.",
+              }
             : {
                 type: "error",
                 text: `Could not select ${model.name}: ${error instanceof Error ? error.message : String(error)}`,
@@ -671,32 +839,18 @@ class CatalogModelPicker extends Container implements Focusable {
     if (this.mode === "downloading") {
       // Downloading is the one modal state: the progress panel is visible, so
       // ignoring everything except cancel cannot read as a dead keyboard.
+      // Stopping is cheap: the partial file stays in the cache, and selecting
+      // the model again resumes from where it left off.
       if (this.keybindings.matches(data, "tui.select.cancel") && this.target) {
         this.target.controller.abort();
-        this.downloadMessage = `Cancelling ${this.target.model.name}`;
-        this.refresh();
-      }
-      return;
-    }
-
-    if (this.mode === "confirm-download") {
-      if (this.keybindings.matches(data, "tui.select.confirm")) {
-        const model = this.pendingModel;
-        if (model) this.startActivation(model);
-      } else if (this.keybindings.matches(data, "tui.select.cancel")) {
-        this.pendingModel = undefined;
-        this.mode = "models";
+        this.downloadSpinner?.setMessage("Stopping…");
         this.refresh();
       }
       return;
     }
 
     if (this.keybindings.matches(data, "tui.input.tab")) {
-      if (this.selectedDuringSession) {
-        if (this.continueAfterActivation) this.requestExit({ type: "complete" });
-      } else {
-        this.requestExit({ type: "change-languages" });
-      }
+      if (!this.selectedDuringSession) this.requestExit({ type: "change-languages" });
       return;
     }
     if (this.keybindings.matches(data, "tui.select.up")) {
@@ -716,13 +870,9 @@ class CatalogModelPicker extends Container implements Focusable {
     if (this.keybindings.matches(data, "tui.select.confirm")) {
       const selected = this.filtered[this.selectedIndex];
       if (!selected) return;
-      if (this.cachedById.has(selected.id)) {
-        this.startActivation(selected);
-      } else {
-        this.pendingModel = selected;
-        this.mode = "confirm-download";
-        this.refresh();
-      }
+      // Enter on a model that is not cached starts its download immediately;
+      // the detail pane already spells out the size, license, and source.
+      this.startActivation(selected);
       return;
     }
     if (this.keybindings.matches(data, "tui.select.cancel")) {
@@ -730,8 +880,6 @@ class CatalogModelPicker extends Container implements Focusable {
         this.search.setValue("");
         this.selectedIndex = 0;
         this.refresh();
-      } else if (this.selectedDuringSession && this.continueAfterActivation) {
-        this.requestExit({ type: "change-languages" });
       } else {
         this.requestExit(undefined);
       }
@@ -745,6 +893,7 @@ class CatalogModelPicker extends Container implements Focusable {
 
   dispose(): void {
     this.disposed = true;
+    this.stopSpinner();
     // Closing cancels only a download; a queued settings commit still lands
     // because the user's Enter already chose it.
     if (this.mode === "downloading") this.target?.controller.abort();
@@ -779,10 +928,9 @@ export async function chooseCatalogModel(
   currentModelId: string | undefined,
   options: {
     onActivate: CatalogModelActivation;
-    continueAfterActivation?: boolean;
-    /** A model was already activated earlier in this flow, so the picker
-     * opens with the post-selection affordances (tab continue, esc back). */
-    alreadyActivated?: boolean;
+    postActivation?: CatalogModelPostActivation;
+    /** A model was already activated earlier in this flow. */
+    activatedInFlow?: boolean;
   },
 ): Promise<CatalogModelPickerResult | undefined> {
   return ctx.ui.custom<CatalogModelPickerResult | undefined>(
@@ -795,187 +943,12 @@ export async function chooseCatalogModel(
         currentModelId,
         done,
         options.onActivate,
-        options.continueAfterActivation,
-        options.alreadyActivated,
+        {
+          postActivation: options.postActivation,
+          activatedInFlow: options.activatedInFlow,
+        },
       ),
   );
-}
-
-type TranscriptionLanguageChoice = {
-  value: TranscriptionLanguage;
-  name: string;
-  preferred: boolean;
-};
-
-class TranscriptionLanguagePicker extends Container implements Focusable {
-  private readonly search = new Input();
-  private readonly list = new Container();
-  private readonly footer = new Text("", TEXT_PADDING, 0);
-  private readonly choices: TranscriptionLanguageChoice[];
-  private filtered: TranscriptionLanguageChoice[] = [];
-  private selectedIndex = 0;
-  private _focused = false;
-
-  get focused(): boolean {
-    return this._focused;
-  }
-
-  set focused(value: boolean) {
-    this._focused = value;
-    this.search.focused = value;
-  }
-
-  constructor(
-    private readonly tui: TUI,
-    private readonly theme: UiTheme,
-    private readonly keybindings: KeybindingsManager,
-    model: CatalogModel,
-    current: TranscriptionLanguage,
-    preferredLanguages: readonly string[],
-    private readonly done: (language: TranscriptionLanguage | undefined) => void,
-  ) {
-    super();
-    const preferred = new Set(preferredLanguages.map(canonicalLanguage));
-    const languages = [...new Set(model.languages)]
-      .map((language) => ({
-        value: language,
-        name: transcriptionLanguageName(language, model.languages),
-        preferred: preferred.has(canonicalLanguage(language)),
-      }))
-      .sort(
-        (left, right) =>
-          Number(right.preferred) - Number(left.preferred) ||
-          left.name.localeCompare(right.name) ||
-          left.value.localeCompare(right.value),
-      );
-    this.choices = [
-      ...(model.capabilities.languageDetection
-        ? [{ value: "auto", name: "Auto detect", preferred: false }]
-        : []),
-      ...languages,
-    ];
-    this.filtered = this.choices;
-    this.selectedIndex = Math.max(
-      0,
-      this.choices.findIndex((choice) => choice.value === current),
-    );
-
-    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-    this.addChild(new Spacer(1));
-    this.addChild(
-      new Text(theme.fg("accent", theme.bold("Choose transcription language")), TEXT_PADDING, 0),
-    );
-    this.addChild(
-      new Text(
-        theme.fg("muted", "★ Your languages are shown first. Type to search."),
-        TEXT_PADDING,
-        0,
-      ),
-    );
-    this.addChild(new Spacer(1));
-    // The search caret sits in the gutter, aligned with the list cursor; its
-    // "> " prompt then puts the typed query on the content edge.
-    const searchBox = new Box(LIST_PADDING, 0);
-    searchBox.addChild(this.search);
-    this.addChild(searchBox);
-    this.addChild(new Spacer(1));
-    this.addChild(this.list);
-    this.addChild(new Spacer(1));
-    this.addChild(this.footer);
-    this.addChild(new Spacer(1));
-    this.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-    this.refresh();
-  }
-
-  private refresh(): void {
-    const query = this.search.getValue().trim();
-    this.filtered = query
-      ? fuzzyFilter(this.choices, query, (choice) => `${choice.name} ${choice.value}`)
-      : this.choices;
-    this.selectedIndex = Math.min(
-      this.selectedIndex,
-      Math.max(0, this.filtered.length - 1),
-    );
-    this.list.clear();
-
-    if (this.filtered.length === 0) {
-      this.list.addChild(new Text(this.theme.fg("muted", "  No matching languages"), LIST_PADDING, 0));
-    } else {
-      const [start, end] = selectedWindow(
-        this.filtered,
-        this.selectedIndex,
-        MAX_VISIBLE_LANGUAGES,
-      );
-      for (let index = start; index < end; index += 1) {
-        const choice = this.filtered[index]!;
-        const active = index === this.selectedIndex;
-        const prefix = active ? this.theme.fg("accent", "→ ") : "  ";
-        const nameText = padColumn(choice.name, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
-        const name = active ? this.theme.fg("accent", nameText) : nameText;
-        const code = choice.value === "auto" ? "" : this.theme.fg("dim", choice.value);
-        const yours = choice.preferred ? `  ${this.theme.fg("accent", "★")}` : "";
-        this.list.addChild(new Text(`${prefix}${name}  ${code}${yours}`, LIST_PADDING, 0));
-      }
-      if (start > 0 || end < this.filtered.length) {
-        this.list.addChild(
-          new Text(
-            this.theme.fg(
-              "muted",
-              `  (${this.selectedIndex + 1}/${this.filtered.length})`,
-            ),
-            LIST_PADDING,
-            0,
-          ),
-        );
-      }
-    }
-
-    const shown = query
-      ? `${this.filtered.length}/${this.choices.length} matching languages`
-      : `${this.choices.length} choices`;
-    this.footer.setText(
-      `${this.theme.fg("dim", shown)}\n${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "choose")}  ${keyHint("tui.select.cancel", query ? "clear search" : "cancel")}`,
-    );
-    this.tui.requestRender();
-  }
-
-  handleInput(data: string): void {
-    if (this.keybindings.matches(data, "tui.select.up")) {
-      if (this.filtered.length > 0) {
-        this.selectedIndex =
-          this.selectedIndex === 0 ? this.filtered.length - 1 : this.selectedIndex - 1;
-        this.refresh();
-      }
-      return;
-    }
-    if (this.keybindings.matches(data, "tui.select.down")) {
-      if (this.filtered.length > 0) {
-        this.selectedIndex =
-          this.selectedIndex === this.filtered.length - 1 ? 0 : this.selectedIndex + 1;
-        this.refresh();
-      }
-      return;
-    }
-    if (this.keybindings.matches(data, "tui.select.confirm")) {
-      const selected = this.filtered[this.selectedIndex];
-      if (selected) this.done(selected.value);
-      return;
-    }
-    if (this.keybindings.matches(data, "tui.select.cancel")) {
-      if (this.search.getValue()) {
-        this.search.setValue("");
-        this.selectedIndex = 0;
-        this.refresh();
-      } else {
-        this.done(undefined);
-      }
-      return;
-    }
-
-    this.search.handleInput(data);
-    this.selectedIndex = 0;
-    this.refresh();
-  }
 }
 
 export function transcriptionLanguageSummary(
@@ -987,22 +960,59 @@ export function transcriptionLanguageSummary(
     : transcriptionLanguageName(language, model.languages);
 }
 
-export async function chooseTranscriptionLanguage(
-  ctx: ExtensionContext,
+/** Single-choice picker over a model's transcription languages. */
+export function createTranscriptionLanguagePicker(
+  tui: TUI,
+  theme: UiTheme,
+  keybindings: KeybindingsManager,
   model: CatalogModel,
   current: TranscriptionLanguage,
   preferredLanguages: readonly string[],
-): Promise<TranscriptionLanguage | undefined> {
-  return ctx.ui.custom<TranscriptionLanguage | undefined>(
-    (tui, theme, keybindings, done) =>
-      new TranscriptionLanguagePicker(
-        tui,
-        theme,
-        keybindings,
-        model,
-        current,
-        preferredLanguages,
-        done,
-      ),
+  done: (language: TranscriptionLanguage | undefined) => void,
+): SingleSelectPicker<TranscriptionLanguage> {
+  const preferred = new Set(preferredLanguages.map(canonicalLanguage));
+  const isPreferred = (value: TranscriptionLanguage): boolean =>
+    value !== "auto" && preferred.has(canonicalLanguage(value));
+  const languages: SingleSelectChoice<TranscriptionLanguage>[] = [
+    ...new Set(model.languages),
+  ]
+    .map((language) => ({
+      value: language,
+      label: transcriptionLanguageName(language, model.languages),
+    }))
+    .sort(
+      (left, right) =>
+        Number(isPreferred(right.value)) - Number(isPreferred(left.value)) ||
+        left.label.localeCompare(right.label) ||
+        left.value.localeCompare(right.value),
+    );
+  const choices: SingleSelectChoice<TranscriptionLanguage>[] = [
+    ...(model.capabilities.languageDetection
+      ? [{ value: "auto", label: "Auto detect" }]
+      : []),
+    ...languages,
+  ];
+  return new SingleSelectPicker(
+    tui,
+    theme,
+    keybindings,
+    choices,
+    current,
+    {
+      title: "Choose transcription language",
+      subtitle: model.capabilities.languageDetection
+        ? "Language expected in recordings, or automatic detection."
+        : "Language expected in recordings.",
+      searchable: true,
+      maximumVisible: MAX_VISIBLE_LANGUAGES,
+      cancelLabel: "back",
+      renderLabel: (choice, active) => {
+        const nameText = padToWidth(choice.label, TRANSCRIPTION_LANGUAGE_NAME_WIDTH);
+        const name = active ? theme.fg("accent", nameText) : nameText;
+        const code = choice.value === "auto" ? "" : theme.fg("dim", choice.value);
+        return `${name}  ${code}`;
+      },
+    },
+    done,
   );
 }

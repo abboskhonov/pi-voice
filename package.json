@@ -34,8 +34,8 @@
     "test": "npm run check && node scripts/run-tests.mjs",
     "prepublishOnly": "npm test",
     "catalog:generate": "node scripts/generate-catalog.mjs",
-    "catalog:verify": "node scripts/verify-catalog.mjs",
-    "catalog:update-metadata": "node scripts/update-catalog-metadata.mjs"
+    "catalog:verify": "node scripts/catalog-metadata.mjs",
+    "catalog:update-metadata": "node scripts/catalog-metadata.mjs --write"
   },
   "pi": {
     "extensions": [

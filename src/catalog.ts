@@ -34,6 +34,10 @@ export function canonicalLanguage(language: string): string {
 }
 
 export function displayLanguage(language: string): string {
+  // ASR catalogs conventionally use zh for Mandarin and list Cantonese as yue.
+  // Make that spoken-language distinction explicit without losing the familiar
+  // umbrella term users look for.
+  if (canonicalLanguage(language) === "zh") return "Mandarin (Chinese)";
   try {
     return languageNames.of(language) ?? language;
   } catch {
@@ -62,7 +66,7 @@ export function modelMatchesLanguage(model: CatalogModel, language: string): boo
   return model.languages.some((supported) => canonicalLanguage(supported) === wanted);
 }
 
-export function preferredLanguageMatchCount(
+function preferredLanguageMatchCount(
   model: CatalogModel,
   preferredLanguages: readonly string[],
 ): number {

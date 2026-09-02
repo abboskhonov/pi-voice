@@ -1,7 +1,7 @@
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 import { convertFrames } from "./pcm.js";
 
-export const STREAM_CHUNK_SAMPLES = CAPTURE_SAMPLE_RATE / 2;
+const STREAM_CHUNK_SAMPLES = CAPTURE_SAMPLE_RATE / 2;
 
 /** Coalesces recorder frames into fresh Float32 PCM chunks without timers. */
 export class PcmChunker {

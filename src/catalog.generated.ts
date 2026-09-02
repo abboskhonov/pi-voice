@@ -1439,7 +1439,7 @@ export const CATALOG_MODELS_GENERATED = [
   },
   {
     "id": "multitalker-parakeet-streaming-0.6b-v1",
-    "name": "Multitalker Parakeet Streaming EN",
+    "name": "Parakeet Multitalker EN",
     "description": "English speech-to-text with streaming, token-level timestamps.",
     "repository": "handy-computer/multitalker-parakeet-streaming-0.6b-v1-gguf",
     "revision": "0314bc0d2f4be9a0d79fa5eeb36ad1f3962cfcbb",
