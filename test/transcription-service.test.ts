@@ -268,6 +268,41 @@ test("a different model is unloaded and loaded at the queue boundary", async () 
   await harness.service.shutdown();
 });
 
+test("an empty streamed result falls back to batch transcription", async () => {
+  const events: string[] = [];
+  const service = createTestService({
+    async startStream() {
+      events.push("stream:start");
+      return createTestStream({
+        async finalize() {
+          events.push("stream:finalize");
+          return "";
+        },
+        reset() {
+          events.push("stream:reset");
+        },
+      });
+    },
+    async transcribe() {
+      events.push("batch:fallback");
+      return "batch text";
+    },
+  });
+
+  const reservation = service.reserveDictation(settings("model-a"));
+  await reservation.ready;
+  reservation.feed(pcm(7));
+
+  assert.equal(await reservation.submit(pcm(9)), "batch text");
+  assert.deepEqual(events, [
+    "stream:start",
+    "stream:finalize",
+    "stream:reset",
+    "batch:fallback",
+  ]);
+  await service.shutdown();
+});
+
 test("a stream releases the model before the next batch run", async () => {
   const events: string[] = [];
   let streamActive = false;

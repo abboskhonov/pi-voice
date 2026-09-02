@@ -1,4 +1,4 @@
-# pi-transcribe
+# pi-voice
 
 Local speech-to-text dictation for Pi.
 
@@ -7,14 +7,10 @@ Local speech-to-text dictation for Pi.
 Install directly from GitHub:
 
 ```bash
-pi install ssh://git@github.com/earendil-works/pi-transcribe
+pi install https://github.com/abboskhonov/pi-voice
 ```
 
-After the first npm release, it can also be installed with:
-
-```bash
-pi install npm:@earendil-works/pi-transcribe
-```
+This fork is currently installed directly from GitHub; an npm package is not published yet.
 
 ## Usage
 
@@ -28,13 +24,13 @@ To develop or run it from a checkout:
 
 ```bash
 npm install --ignore-scripts
-pi -e /absolute/path/to/pi-transcribe
+pi -e /absolute/path/to/pi-voice
 ```
 
 While iterating on setup, enable the debug-only onboarding command when starting Pi:
 
 ```bash
-PI_TRANSCRIBE_DEBUG=1 pi -e /absolute/path/to/pi-transcribe
+PI_TRANSCRIBE_DEBUG=1 pi -e /absolute/path/to/pi-voice
 ```
 
 Then run `/transcribe-onboarding` to replay the complete onboarding flow. The command is not registered unless `PI_TRANSCRIBE_DEBUG=1`. Canceling before selecting a model leaves the current configuration unchanged; model selections are applied immediately.

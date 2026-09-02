@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/earendil-works/pi-transcribe.git"
+    "url": "git+https://github.com/abboskhonov/pi-voice.git"
   },
-  "homepage": "https://github.com/earendil-works/pi-transcribe#readme",
+  "homepage": "https://github.com/abboskhonov/pi-voice#readme",
   "bugs": {
-    "url": "https://github.com/earendil-works/pi-transcribe/issues"
+    "url": "https://github.com/abboskhonov/pi-voice/issues"
   },
   "files": [
     "src",

@@ -1,5 +1,7 @@
 import { PvRecorder } from "@picovoice/pvrecorder-node";
-import { execFile } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 import { convertFrames } from "./pcm.js";
@@ -9,6 +11,11 @@ export { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 const FRAME_LENGTH = 512;
 
 const execFileAsync = promisify(execFile);
+type PipeWireRecorder = ChildProcessByStdio<null, Readable, Readable>;
+
+function pipeWireAvailable(): boolean {
+  return spawnSync("pw-record", ["--version"], { stdio: "ignore" }).status === 0;
+}
 
 interface CapturedAudio {
   pcm: Float32Array;
@@ -102,6 +109,7 @@ function findDeviceIndex(devices: readonly string[], selected: SelectedMicrophon
 
 export class MicrophoneCapture {
   private recorder: PvRecorder | undefined;
+  private pipeWireRecorder: PipeWireRecorder | undefined;
   private frames: Int16Array[] = [];
   private readLoop: Promise<void> | undefined;
   private stopping = false;
@@ -111,7 +119,22 @@ export class MicrophoneCapture {
   constructor(private readonly selectedDevice?: SelectedMicrophone) {}
 
   start(): void {
-    if (this.recorder) throw new Error("Microphone capture is already active");
+    if (this.recorder || this.pipeWireRecorder) {
+      throw new Error("Microphone capture is already active");
+    }
+
+    this.frames = [];
+    this.stopping = false;
+    this.readError = undefined;
+
+    // On Linux, miniaudio's default ALSA route can bypass PipeWire's selected
+    // source and return a different capture stream. Use PipeWire directly so
+    // system-default and explicitly selected microphones mean the same thing
+    // as they do in the desktop audio controls.
+    if (process.platform === "linux" && pipeWireAvailable()) {
+      this.startPipeWire();
+      return;
+    }
 
     const deviceIndex = this.selectedDevice
       ? findDeviceIndex(getAvailableMicrophones(), this.selectedDevice)
@@ -131,9 +154,6 @@ export class MicrophoneCapture {
         );
       }
 
-      this.frames = [];
-      this.stopping = false;
-      this.readError = undefined;
       recorder.start();
       this.recorder = recorder;
       this.readLoop = this.readFrames(recorder);
@@ -145,13 +165,17 @@ export class MicrophoneCapture {
 
   async stop(): Promise<CapturedAudio> {
     const recorder = this.recorder;
-    if (!recorder) throw new Error("Microphone capture is not active");
+    const pipeWireRecorder = this.pipeWireRecorder;
+    if (!recorder && !pipeWireRecorder) {
+      throw new Error("Microphone capture is not active");
+    }
 
     this.stopping = true;
     let stopError: Error | undefined;
 
     try {
-      if (recorder.isRecording) recorder.stop();
+      if (recorder?.isRecording) recorder.stop();
+      if (pipeWireRecorder && !pipeWireRecorder.killed) pipeWireRecorder.kill("SIGTERM");
     } catch (error) {
       stopError = toError(error);
     }
@@ -159,14 +183,75 @@ export class MicrophoneCapture {
     try {
       await this.readLoop;
     } finally {
-      recorder.release();
+      recorder?.release();
       this.recorder = undefined;
+      this.pipeWireRecorder = undefined;
       this.readLoop = undefined;
     }
 
     if (stopError) throw stopError;
     if (this.readError) throw this.readError;
     return { pcm: convertFrames(this.frames) };
+  }
+
+  private startPipeWire(): void {
+    const args = [
+      "--raw",
+      "--media-category",
+      "Capture",
+      "--rate",
+      String(CAPTURE_SAMPLE_RATE),
+      "--channels",
+      "1",
+      "--format",
+      "s16",
+    ];
+    if (this.selectedDevice) args.push("--target", this.selectedDevice.name);
+    args.push("-");
+
+    const recorder = spawn("pw-record", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    this.pipeWireRecorder = recorder;
+    recorder.stderr.resume();
+    recorder.once("error", (error) => {
+      if (!this.stopping) this.readError = toError(error);
+    });
+    recorder.once("close", (code, signal) => {
+      if (!this.stopping && code !== 0) {
+        this.readError = new Error(
+          `pw-record exited unexpectedly${signal ? ` (${signal})` : ` with code ${code ?? "unknown"}`}`,
+        );
+      }
+    });
+    this.readLoop = this.readPipeWireFrames(recorder);
+  }
+
+  private async readPipeWireFrames(
+    recorder: PipeWireRecorder,
+  ): Promise<void> {
+    let pending = Buffer.alloc(0);
+    try {
+      for await (const chunk of recorder.stdout) {
+        if (this.stopping) continue;
+        pending = Buffer.concat([pending, chunk]);
+        while (pending.length >= FRAME_LENGTH * 2) {
+          const frame = new Int16Array(FRAME_LENGTH);
+          for (let index = 0; index < FRAME_LENGTH; index += 1) {
+            frame[index] = pending.readInt16LE(index * 2);
+          }
+          pending = pending.subarray(FRAME_LENGTH * 2);
+          this.frames.push(frame);
+          try {
+            this.onFrame?.(frame);
+          } catch {
+            // Visualizer updates must not fail the recording.
+          }
+        }
+      }
+    } catch (error) {
+      if (!this.stopping) this.readError = toError(error);
+    }
   }
 
   private async readFrames(recorder: PvRecorder): Promise<void> {

@@ -425,8 +425,14 @@ export class TranscriptionService {
         try {
           const text = await stream.finalize();
           state.signal?.throwIfAborted();
-          state.result.resolve(text);
-          return;
+          // Short recordings can produce no committed text on the streaming
+          // path even though the batch decoder can recognize them. Fall back
+          // to the complete clip instead of reporting a false empty result.
+          if (text) {
+            state.result.resolve(text);
+            return;
+          }
+          state.streamError = new Error("Streaming transcription returned no text");
         } catch (error) {
           if (state.signal?.aborted) throw abortError(state.signal);
           state.streamError = error;
