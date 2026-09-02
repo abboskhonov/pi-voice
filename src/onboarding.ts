@@ -102,9 +102,9 @@ export async function runModelSelection(
       }
     }
 
-    // Once a model has been committed, Esc from the model pane goes back to
-    // languages and a second Esc closes the flow. Without this, both panes
-    // route cancel back to each other and repeated Esc can never get out.
+    // Reaching the language pane after a commit takes a Tab that landed while
+    // the save was in flight. Esc there closes the flow instead of bouncing
+    // back to a model pane that no longer offers the language step.
     if (!changed?.confirmed && configured) return configured;
   }
 }
