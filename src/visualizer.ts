@@ -1,5 +1,4 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Loader } from "@earendil-works/pi-tui";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 import { STATUS_WIDGET_KEY } from "./shortcut-core.js";
 
@@ -107,38 +106,12 @@ function formatElapsed(ms: number): string {
 export function showTranscribeStatus(
   ctx: ExtensionContext,
   text: string,
-  options?: { cancelable?: boolean; spinner?: boolean },
+  options?: { cancelable?: boolean },
 ): void {
   if (!ctx.hasUI) return;
-
-  if (!options?.spinner) {
-    const theme = ctx.ui.theme;
-    const hint = options?.cancelable ? `  ${theme.fg("dim", "esc to cancel")}` : "";
-    ctx.ui.setWidget(WIDGET_KEY, [`${theme.fg("muted", text)}${hint}`]);
-    return;
-  }
-
-  ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
-    const message = () =>
-      `${theme.fg("muted", text)}${options.cancelable ? `  ${theme.fg("dim", "esc to cancel")}` : ""}`;
-    const loader = new Loader(
-      tui,
-      (frame) => theme.fg("accent", frame),
-      (value) => value,
-      message(),
-    );
-
-    return {
-      render: (width: number) => loader.render(width),
-      invalidate(): void {
-        loader.invalidate();
-        loader.setMessage(message());
-      },
-      dispose(): void {
-        loader.stop();
-      },
-    };
-  });
+  const theme = ctx.ui.theme;
+  const hint = options?.cancelable ? `  ${theme.fg("dim", "esc to cancel")}` : "";
+  ctx.ui.setWidget(WIDGET_KEY, [`${theme.fg("muted", text)}${hint}`]);
 }
 
 export function clearTranscribeWidget(ctx: ExtensionContext): void {

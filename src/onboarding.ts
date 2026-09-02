@@ -3,11 +3,9 @@ import {
   chooseCatalogModel,
   chooseLanguages,
   defaultSpokenLanguages,
+  type CatalogModelPostActivation,
 } from "./model-picker.js";
-import {
-  downloadCatalogModel,
-  findCachedCatalogModel,
-} from "./models.js";
+import { createModelActivation } from "./model-activation.js";
 import {
   DEFAULT_MICROPHONE,
   settingsForModel,
@@ -32,8 +30,9 @@ type ModelSelectionOptions = {
   chineseOutput?: ChineseOutput;
   currentModelId?: string;
   microphone?: MicrophoneSetting;
+  /** Persists language changes made before this flow activates a model. */
   onPreferredLanguagesChange?: (languages: string[]) => Promise<void>;
-  continueAfterSelection?: boolean;
+  postActivation?: CatalogModelPostActivation;
 };
 
 export async function runModelSelection(
@@ -47,17 +46,21 @@ export async function runModelSelection(
   ];
   let currentModelId = options.currentModelId;
   let configured: TranscribeSettings | undefined;
-  // Back-to-back selections can outrun their settings writes. Commits run in
-  // selection order, so the file always ends on the user's last choice.
-  let commitQueue: Promise<void> = Promise.resolve();
-  const enqueueCommit = (commit: () => Promise<void>): Promise<void> => {
-    const result = commitQueue.then(commit);
-    commitQueue = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  };
+  const { activate, waitForCommits } = createModelActivation({
+    buildSettings: (model, path) =>
+      settingsForModel(model.id, path, {
+        shortcut: configured?.shortcut ?? options.shortcut ?? DEFAULT_SHORTCUT,
+        preferredLanguages,
+        transcriptionLanguage:
+          configured?.transcriptionLanguage ?? options.transcriptionLanguage,
+        chineseOutput: configured?.chineseOutput ?? options.chineseOutput,
+        microphone: configured?.microphone ?? options.microphone ?? DEFAULT_MICROPHONE,
+      }),
+    onCommitted: (settings) => {
+      configured = settings;
+      currentModelId = settings.model.id;
+    },
+  });
 
   while (true) {
     const selection = await chooseCatalogModel(
@@ -65,60 +68,16 @@ export async function runModelSelection(
       preferredLanguages,
       currentModelId,
       {
-        continueAfterActivation: options.continueAfterSelection,
-        // Keep the post-selection affordances when the picker reopens after a
+        postActivation: options.postActivation,
+        // Keep the post-selection state when the picker reopens after a
         // round-trip through the language step.
-        alreadyActivated: configured !== undefined,
-        onActivate: async (model, { cached, signal, onProgress }) => {
-          let path: string;
-          if (cached) {
-            // The picker listed the cache when it opened; re-check so settings
-            // never point at a file that has since been evicted. Integrity is
-            // covered by the download-time hash and the size check here.
-            const stillCached = findCachedCatalogModel(model);
-            if (!stillCached) {
-              throw new Error(
-                "the downloaded file is missing; select the model again to re-download it",
-              );
-            }
-            path = stillCached.path;
-          } else {
-            path = await downloadCatalogModel(model, { signal, onProgress });
-            // Esc during the download tail cancels the selection even though
-            // the bytes are already cached.
-            signal.throwIfAborted();
-          }
-
-          await enqueueCommit(async () => {
-            // Skip the write when this selection was superseded or its
-            // download was cancelled while the commit sat in the queue.
-            signal.throwIfAborted();
-            let settings: TranscribeSettings;
-            try {
-              settings = settingsForModel(model.id, path, {
-                shortcut: configured?.shortcut ?? options.shortcut ?? DEFAULT_SHORTCUT,
-                preferredLanguages,
-                transcriptionLanguage:
-                  configured?.transcriptionLanguage ?? options.transcriptionLanguage,
-                chineseOutput: configured?.chineseOutput ?? options.chineseOutput,
-                microphone: configured?.microphone ?? options.microphone ?? DEFAULT_MICROPHONE,
-              });
-              await writeSettings(settings);
-            } catch (error) {
-              throw new Error(
-                `Could not save settings: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            }
-            configured = settings;
-            currentModelId = model.id;
-          });
-          return { path };
-        },
+        activatedInFlow: configured !== undefined,
+        onActivate: activate,
       },
     );
     // The picker can close while its last commit is still in flight; wait so
     // configured reflects every selection that will land on disk.
-    await commitQueue;
+    await waitForCommits();
 
     if (!selection || selection.type === "complete") return configured;
 
@@ -127,12 +86,14 @@ export async function runModelSelection(
     const changed = await chooseLanguages(ctx, preferredLanguages);
     if (changed) {
       try {
-        await options.onPreferredLanguagesChange?.(changed.languages);
-        preferredLanguages = changed.languages;
         if (configured) {
-          configured = { ...configured, preferredLanguages };
-          await writeSettings(configured);
+          const updated = { ...configured, preferredLanguages: changed.languages };
+          await writeSettings(updated);
+          configured = updated;
+        } else {
+          await options.onPreferredLanguagesChange?.(changed.languages);
         }
+        preferredLanguages = changed.languages;
       } catch (error) {
         ctx.ui.notify(
           `Could not save preferred languages: ${error instanceof Error ? error.message : String(error)}`,
@@ -140,6 +101,11 @@ export async function runModelSelection(
         );
       }
     }
+
+    // Reaching the language pane after a commit takes a Tab that landed while
+    // the save was in flight. Esc there closes the flow instead of bouncing
+    // back to a model pane that no longer offers the language step.
+    if (!changed?.confirmed && configured) return configured;
   }
 }
 
@@ -159,7 +125,7 @@ export async function runOnboarding(
     const configured = await runModelSelection(ctx, {
       shortcut,
       preferredLanguages: languages,
-      continueAfterSelection: true,
+      postActivation: "advance",
       onPreferredLanguagesChange: async (changed) => {
         languages = changed;
       },
