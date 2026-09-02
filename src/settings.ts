@@ -11,6 +11,7 @@ import {
 import { DEFAULT_SHORTCUT, normalizeShortcut } from "./shortcut-core.js";
 
 const SETTINGS_VERSION = 1;
+export const SETTINGS_FILE_NAME = "pi-voice.json";
 
 export type MicrophoneSetting =
   | { type: "system-default" }
@@ -52,7 +53,7 @@ type SettingsReadResult = {
 };
 
 function settingsPath(): string {
-  return join(getAgentDir(), "pi-transcribe.json");
+  return join(getAgentDir(), SETTINGS_FILE_NAME);
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

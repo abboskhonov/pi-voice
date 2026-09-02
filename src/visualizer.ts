@@ -103,7 +103,7 @@ function formatElapsed(ms: number): string {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
-export function showTranscribeStatus(
+export function showVoiceStatus(
   ctx: ExtensionContext,
   text: string,
   options?: { cancelable?: boolean },
@@ -114,7 +114,7 @@ export function showTranscribeStatus(
   ctx.ui.setWidget(WIDGET_KEY, [`${theme.fg("muted", text)}${hint}`]);
 }
 
-export function clearTranscribeWidget(ctx: ExtensionContext): void {
+export function clearVoiceWidget(ctx: ExtensionContext): void {
   if (!ctx.hasUI) return;
   ctx.ui.setWidget(WIDGET_KEY, undefined);
 }

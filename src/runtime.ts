@@ -23,7 +23,7 @@ type ActiveRecording = {
   meter: RecordingMeter;
 };
 
-export type PiTranscribeRuntime = {
+export type PiVoiceRuntime = {
   readonly service: TranscriptionService;
   requireConfiguredSettingsForTool(): Promise<TranscribeSettings>;
   toggleCapture(ctx: ExtensionContext): Promise<void>;
@@ -50,10 +50,10 @@ function transcriptionErrorMessage(error: unknown): string {
   return `Local transcription failed: ${message}`;
 }
 
-export function createPiTranscribeRuntime(
+export function createPiVoiceRuntime(
   pi: ExtensionAPI,
   registeredShortcut: string,
-): PiTranscribeRuntime {
+): PiVoiceRuntime {
   let recording: ActiveRecording | undefined;
   let operation: Promise<void> | undefined;
   let transcriptionAbort: AbortController | undefined;
@@ -149,7 +149,7 @@ export function createPiTranscribeRuntime(
       : await configureFirstRun(ctx);
     if (configured) {
       ctx.ui.notify(
-        `Setup complete. Press ${displayShortcut(registeredShortcut)} to start recording and press it again to transcribe. Use /transcribe for settings.`,
+        `Setup complete. Press ${displayShortcut(registeredShortcut)} to start recording and press it again to transcribe. Use /voice for settings.`,
         "info",
       );
     }
@@ -160,17 +160,17 @@ export function createPiTranscribeRuntime(
     await loadSettingsOnce();
     if (settingsReadWarning) {
       throw new Error(
-        `${settingsReadWarning} Ask the user to run /transcribe in Pi's interactive TUI to configure a local model, then retry transcribe_file.`,
+        `${settingsReadWarning} Ask the user to run /voice in Pi's interactive TUI to configure a local model, then retry transcribe_file.`,
       );
     }
     if (!settings) {
       throw new Error(
-        "pi-transcribe is not configured. Ask the user to run /transcribe in Pi's interactive TUI once to choose and download a local model, then retry transcribe_file.",
+        "pi-voice is not configured. Ask the user to run /voice in Pi's interactive TUI once to choose and download a local model, then retry transcribe_file.",
       );
     }
     if (!existsSync(settings.model.path)) {
       throw new Error(
-        `The configured transcription model is missing: ${settings.model.path}. Ask the user to run /transcribe and choose a model again, then retry transcribe_file.`,
+        `The configured transcription model is missing: ${settings.model.path}. Ask the user to run /voice and choose a model again, then retry transcribe_file.`,
       );
     }
     return settings;
@@ -216,14 +216,14 @@ export function createPiTranscribeRuntime(
   }
 
   async function stopAndTranscribe(ctx: ExtensionContext): Promise<void> {
-    const { clearTranscribeWidget, showTranscribeStatus } = await loadVisualizer();
+    const { clearVoiceWidget, showVoiceStatus } = await loadVisualizer();
     const active = recording!;
     recording = undefined;
     // Swap the meter for the transcribe status in place: clearing the slot
     // first would collapse and re-expand the widget area, and capture.stop()
     // is fast enough that an intermediate "finishing capture" state is noise.
     active.meter.stop({ clearWidget: false });
-    showTranscribeStatus(ctx, "Transcribing…", { cancelable: true });
+    showVoiceStatus(ctx, "Transcribing…", { cancelable: true });
 
     try {
       let pcm: Float32Array;
@@ -259,7 +259,7 @@ export function createPiTranscribeRuntime(
       }
     } finally {
       clearCancelListener();
-      clearTranscribeWidget(ctx);
+      clearVoiceWidget(ctx);
     }
   }
 
@@ -362,14 +362,14 @@ export function createPiTranscribeRuntime(
     // noticeable moment; show feedback until the recording meter takes over.
     // Static text on the shared widget slot: an animated spinner repaints every
     // frame, and the meter replaces plain lines without a component swap.
-    const { clearTranscribeWidget, showTranscribeStatus } = await loadVisualizer();
-    showTranscribeStatus(ctx, "Starting microphone…");
+    const { clearVoiceWidget, showVoiceStatus } = await loadVisualizer();
+    showVoiceStatus(ctx, "Starting microphone…");
 
     const configured = await ensureSettings(ctx);
     if (configured) await startRecording(ctx, configured);
     // The meter shares the widget slot and has replaced the spinner when
     // recording began; clear the spinner only when recording never started.
-    if (!recording) clearTranscribeWidget(ctx);
+    if (!recording) clearVoiceWidget(ctx);
   }
 
   function runExclusive(
@@ -377,7 +377,7 @@ export function createPiTranscribeRuntime(
     task: () => Promise<void>,
   ): Promise<void> {
     if (operation) {
-      ctx.ui.notify("A pi-transcribe operation is already in progress", "warning");
+      ctx.ui.notify("A pi-voice operation is already in progress", "warning");
       return operation;
     }
 
@@ -453,7 +453,7 @@ export function createPiTranscribeRuntime(
     }
     if (visualizerModulePromise) {
       const visualizer = await visualizerModulePromise.catch(() => undefined);
-      visualizer?.clearTranscribeWidget(ctx);
+      visualizer?.clearVoiceWidget(ctx);
     }
   }
 

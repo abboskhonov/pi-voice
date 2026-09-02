@@ -100,7 +100,7 @@ export class TranscriptionService {
   ) {}
 
   reserveDictation(settings: TranscribeSettings): DictationReservation {
-    if (this.shuttingDown) throw new Error("pi-transcribe is shutting down");
+    if (this.shuttingDown) throw new Error("pi-voice is shutting down");
     if (this.reservation) throw new Error("A dictation reservation is already active");
 
     const state: ReservationState = {
@@ -174,7 +174,7 @@ export class TranscriptionService {
     pcm: Float32Array,
     signal?: AbortSignal,
   ): Promise<string> {
-    if (this.shuttingDown) return Promise.reject(new Error("pi-transcribe is shutting down"));
+    if (this.shuttingDown) return Promise.reject(new Error("pi-voice is shutting down"));
     if (signal?.aborted) return Promise.reject(abortError(signal));
 
     const result = new Promise<string>((resolve, reject) => {
@@ -528,8 +528,8 @@ export class TranscriptionService {
   async shutdown(): Promise<void> {
     if (!this.shuttingDown) {
       this.shuttingDown = true;
-      this.shutdownController.abort(new Error("pi-transcribe is shutting down"));
-      const shutdownError = new Error("pi-transcribe is shutting down");
+      this.shutdownController.abort(new Error("pi-voice is shutting down"));
+      const shutdownError = new Error("pi-voice is shutting down");
       this.reservation = undefined;
       this.dictationQueue.length = 0;
       for (const reservation of this.reservationStates) {

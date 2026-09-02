@@ -1,22 +1,22 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerFileTranscriptionTool } from "./file-transcription.js";
-import type { PiTranscribeRuntime } from "./runtime.js";
+import type { PiVoiceRuntime } from "./runtime.js";
 import { STATUS_WIDGET_KEY } from "./shortcut-core.js";
 import { readShortcutForRegistration } from "./startup-shortcut.js";
 
 // Pi awaits extension module evaluation before continuing startup. Keep this
 // entry point registration-only and load feature implementations on first use.
-export default function piTranscribe(pi: ExtensionAPI): void {
+export default function piVoice(pi: ExtensionAPI): void {
   const registeredShortcut = readShortcutForRegistration();
-  let runtimePromise: Promise<PiTranscribeRuntime> | undefined;
+  let runtimePromise: Promise<PiVoiceRuntime> | undefined;
   let shuttingDown = false;
 
-  function loadRuntime(): Promise<PiTranscribeRuntime> {
-    if (shuttingDown) return Promise.reject(new Error("pi-transcribe is shutting down"));
+  function loadRuntime(): Promise<PiVoiceRuntime> {
+    if (shuttingDown) return Promise.reject(new Error("pi-voice is shutting down"));
     if (runtimePromise) return runtimePromise;
 
-    const loading = import("./runtime.js").then(({ createPiTranscribeRuntime }) =>
-      createPiTranscribeRuntime(pi, registeredShortcut),
+    const loading = import("./runtime.js").then(({ createPiVoiceRuntime }) =>
+      createPiVoiceRuntime(pi, registeredShortcut),
     );
     runtimePromise = loading;
     void loading.catch(() => {
@@ -53,14 +53,14 @@ export default function piTranscribe(pi: ExtensionAPI): void {
     },
   );
 
-  pi.registerCommand("transcribe", {
-    description: "Open pi-transcribe settings",
+  pi.registerCommand("voice", {
+    description: "Open pi-voice settings",
     handler: async (_args, ctx) => (await loadRuntime()).showSettings(ctx),
   });
 
-  if (process.env.PI_TRANSCRIBE_DEBUG === "1") {
-    pi.registerCommand("transcribe-onboarding", {
-      description: "Replay pi-transcribe onboarding (debug)",
+  if (process.env.PI_VOICE_DEBUG === "1") {
+    pi.registerCommand("voice-onboarding", {
+      description: "Replay pi-voice onboarding (debug)",
       handler: async (_args, ctx) => (await loadRuntime()).replayOnboarding(ctx),
     });
   }

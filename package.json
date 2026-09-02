@@ -1,5 +1,5 @@
 {
-  "name": "@earendil-works/pi-transcribe",
+  "name": "@abboskhonov/pi-voice",
   "version": "0.0.1",
   "description": "Local speech-to-text dictation for Pi",
   "type": "module",

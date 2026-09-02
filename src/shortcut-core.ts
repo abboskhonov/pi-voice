@@ -1,7 +1,7 @@
 export const DEFAULT_SHORTCUT = "ctrl+alt+z";
 
 /** Widget slot shared by the startup status and the recording meter. */
-export const STATUS_WIDGET_KEY = "pi-transcribe-meter";
+export const STATUS_WIDGET_KEY = "pi-voice-meter";
 
 const MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"] as const;
 const SPECIAL_KEYS = new Set([

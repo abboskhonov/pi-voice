@@ -11,7 +11,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 export function readShortcutForRegistration(): string {
   try {
     const parsed: unknown = JSON.parse(
-      readFileSync(join(getAgentDir(), "pi-transcribe.json"), "utf8"),
+      readFileSync(join(getAgentDir(), "pi-voice.json"), "utf8"),
     );
     if (!isObject(parsed) || parsed.version !== 1 || typeof parsed.shortcut !== "string") {
       return DEFAULT_SHORTCUT;

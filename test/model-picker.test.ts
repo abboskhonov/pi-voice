@@ -17,7 +17,7 @@ import { CATALOG_MODELS, type CatalogModel } from "../src/catalog.js";
 import { keybindings, stripAnsi, testTheme, testTui } from "./ui-helpers.js";
 
 // Keep cache and partial-download probes away from the real Hugging Face cache.
-process.env.HF_HUB_CACHE = mkdtempSync(join(tmpdir(), "pi-transcribe-picker-"));
+process.env.HF_HUB_CACHE = mkdtempSync(join(tmpdir(), "pi-voice-picker-"));
 
 initTheme("dark");
 

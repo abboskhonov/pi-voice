@@ -56,7 +56,7 @@ function wrapLongLines(text: string): string {
 }
 
 async function saveFullTranscript(text: string): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "pi-transcribe-"));
+  const directory = await mkdtemp(join(tmpdir(), "pi-voice-"));
   const path = join(directory, "transcript.txt");
   await writeFile(path, `${text}\n`, "utf8");
   return path;
@@ -83,7 +83,7 @@ export function registerFileTranscriptionTool(
   pi.registerTool({
     name: "transcribe_file",
     label: "Transcribe File",
-    description: `Transcribe speech from a local audio or video file using pi-transcribe's configured local model. Requires the ffmpeg executable on PATH (or PI_TRANSCRIBE_FFMPEG_PATH). Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; a complete transcript is saved to a temporary file when needed.`,
+    description: `Transcribe speech from a local audio or video file using pi-voice's configured local model. Requires the ffmpeg executable on PATH (or PI_VOICE_FFMPEG_PATH). Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; a complete transcript is saved to a temporary file when needed.`,
     promptSnippet: "Transcribe speech from local audio or video files with a local model",
     promptGuidelines: [
       "Use transcribe_file when speech in a local audio or video file needs to be read, analyzed, or transcribed.",
@@ -97,7 +97,7 @@ export function registerFileTranscriptionTool(
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      if (shuttingDown) throw new Error("pi-transcribe is shutting down");
+      if (shuttingDown) throw new Error("pi-voice is shutting down");
       const operationSignal = signal
         ? AbortSignal.any([signal, shutdownController.signal])
         : shutdownController.signal;
@@ -205,7 +205,7 @@ export function registerFileTranscriptionTool(
   return {
     async shutdown() {
       shuttingDown = true;
-      shutdownController.abort(new Error("pi-transcribe is shutting down"));
+      shutdownController.abort(new Error("pi-voice is shutting down"));
       await Promise.allSettled([...operations]);
     },
   };

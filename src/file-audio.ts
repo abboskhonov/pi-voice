@@ -7,7 +7,7 @@ const MAX_DECODED_BYTES = 128 * 1024 * 1024;
 const MAX_STDERR_CHARS = 8 * 1024;
 
 function ffmpegExecutable(): string {
-  return process.env.PI_TRANSCRIBE_FFMPEG_PATH?.trim() || "ffmpeg";
+  return process.env.PI_VOICE_FFMPEG_PATH?.trim() || "ffmpeg";
 }
 
 function installHint(): string {
@@ -22,9 +22,9 @@ function installHint(): string {
 }
 
 function missingFfmpegError(executable: string): Error {
-  const configured = process.env.PI_TRANSCRIBE_FFMPEG_PATH?.trim();
+  const configured = process.env.PI_VOICE_FFMPEG_PATH?.trim();
   const locationHelp = configured
-    ? `The configured PI_TRANSCRIBE_FFMPEG_PATH (${configured}) could not be found. Correct it or unset it to use PATH.`
+    ? `The configured PI_VOICE_FFMPEG_PATH (${configured}) could not be found. Correct it or unset it to use PATH.`
     : "The ffmpeg executable was not found on PATH.";
   return new Error(
     [
